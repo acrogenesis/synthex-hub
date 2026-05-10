@@ -127,37 +127,63 @@ defmodule Server.Queue do
   # ── Worker API ──────────────────────────────────────────────
 
   @doc """
-  Atomically claim the oldest available chunk. Marks the Oban job
-  as `executing` with the worker_id recorded; Oban Lifeline will
-  rescue it if no completion arrives within `rescue_after`.
-  Returns `{:ok, payload}` or `:empty`.
+  Atomically claim a chunk, fair-sharing across concurrently-active
+  batches. Marks the Oban job as `executing` with the worker_id
+  recorded; Oban Lifeline will rescue it if no completion arrives
+  within `rescue_after`. Returns `{:ok, payload}` or `:empty`.
+
+  ## Fairness
+
+  We rank each batch's available chunks by `scheduled_at` (oldest
+  first) using `ROW_NUMBER() OVER (PARTITION BY batch_id ...)`, then
+  pick the chunk whose rank-within-its-batch is smallest. That
+  interleaves batches naturally: with a 7338-chunk batch already
+  in flight, a new 1000-chunk batch immediately gets every other
+  claim instead of waiting in line. Priority is still honored as
+  the primary tiebreaker so an opt-in "high-priority" batch can
+  jump ahead.
   """
   def claim_chunk(worker_id) do
+    sql = """
+    WITH ranked AS (
+      SELECT
+        id,
+        priority,
+        ROW_NUMBER() OVER (
+          PARTITION BY (args->>'batch_id')
+          ORDER BY scheduled_at ASC, id ASC
+        ) AS rn
+      FROM oban_jobs
+      WHERE state = 'available' AND queue = 'chunks'
+    )
+    SELECT j.id
+    FROM oban_jobs j
+    JOIN ranked r ON r.id = j.id
+    WHERE j.state = 'available' AND j.queue = 'chunks'
+    ORDER BY j.priority ASC, r.rn ASC, j.scheduled_at ASC, j.id ASC
+    LIMIT 1
+    FOR UPDATE OF j SKIP LOCKED
+    """
+
     Repo.transaction(fn ->
-      job =
-        from(j in Oban.Job,
-          where: j.state == "available" and j.queue == "chunks",
-          order_by: [asc: j.priority, asc: j.scheduled_at, asc: j.id],
-          limit: 1,
-          lock: "FOR UPDATE SKIP LOCKED"
-        )
-        |> Repo.one()
+      case Repo.query!(sql) do
+        %Postgrex.Result{rows: [[job_id]]} ->
+          job = Repo.get!(Oban.Job, job_id)
+          now = DateTime.utc_now()
 
-      if job do
-        now = DateTime.utc_now()
-
-        {:ok, claimed} =
-          Repo.update(
-            Ecto.Changeset.change(job,
-              state: "executing",
-              attempted_at: now,
-              attempted_by: [worker_id]
+          {:ok, claimed} =
+            Repo.update(
+              Ecto.Changeset.change(job,
+                state: "executing",
+                attempted_at: now,
+                attempted_by: [worker_id]
+              )
             )
-          )
 
-        chunk_payload_for_worker(claimed)
-      else
-        Repo.rollback(:empty)
+          chunk_payload_for_worker(claimed)
+
+        %Postgrex.Result{rows: []} ->
+          Repo.rollback(:empty)
       end
     end)
     |> case do

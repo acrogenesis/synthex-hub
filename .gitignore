@@ -1,0 +1,33 @@
+# ── Elixir / Mix ────────────────────────────────────────────
+_build/
+deps/
+*.beam
+*.ez
+erl_crash.dump
+.elixir_ls/
+
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# ── Logs ────────────────────────────────────────────────────
+*.log
+
+# ── Secrets — never commit ─────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── OS / editor ─────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# ── Docker / compose state ──────────────────────────────────
+postgres-data/

@@ -1,0 +1,68 @@
+# Production stack for Synthex Hub at synthex.fit, fronted by a
+# Cloudflare Tunnel. Run from this directory:
+#
+#     cp .env.example .env       # fill in TUNNEL_TOKEN, API_TOKEN, etc.
+#     docker compose up -d
+#
+# The stack:
+#   postgres     persistent Oban + batches + workers tables
+#   server       mix release; runs migrations on boot
+#   cloudflared  outbound-only tunnel; routes synthex.fit/api → server:4000
+
+name: synthex-hub
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-synthex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB:       ${POSTGRES_DB:-synthex_hub}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  server:
+    build:
+      context: ../../server
+      dockerfile: Dockerfile
+    image: synthex-hub-server:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MIX_ENV: prod
+      DATABASE_URL: postgres://${POSTGRES_USER:-synthex}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-synthex_hub}
+      WAIT_FOR_DB: postgres:5432
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env}
+      PORT: "4000"
+      DEFAULT_CHUNK_SIZE: ${DEFAULT_CHUNK_SIZE:-100}
+      WORKER_HEARTBEAT_TIMEOUT_SECS: ${WORKER_HEARTBEAT_TIMEOUT_SECS:-120}
+      # Set this if you mint a SECRET_KEY_BASE for sessions later;
+      # it's not required by the current API but Plug recommends one.
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:4000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN from `cloudflared tunnel create`}
+
+volumes:
+  pgdata:

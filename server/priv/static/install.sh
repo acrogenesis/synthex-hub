@@ -1,0 +1,248 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# Synthex Hub — worker installer.
+#
+# Run via:
+#
+#     curl -fsSL https://synthex.fit/install | sh
+#
+# Default behavior: build the worker image directly from the public
+# GitHub repo — no registry, no `git clone`, no `docker login`. Docker
+# fetches the source, builds, runs.
+#
+# Required env (or you'll be prompted):
+#     API_TOKEN          shared bearer token (ask the operator)
+#
+# Optional env:
+#     SERVER_URL         default: https://synthex.fit/api
+#     WORKER_NAME        default: $(hostname)
+#     POOL_SIZE          default: number of CPU cores
+#     CONTAINER_NAME     default: synthex-worker
+#
+#     # Build mode (default):
+#     BUILD_FROM         git URL + ref + subdir for the build context.
+#                        default: https://github.com/rcc/synthex-hub.git#main:worker
+#     LOCAL_TAG          local tag for the built image.
+#                        default: synthex-worker:local
+#
+#     # Pull mode (override):
+#     IMAGE              if set, skip the build step and `docker pull`
+#                        this image instead. e.g. ghcr.io/rcc/synthex-worker:latest
+#
+set -eu
+
+# ── colors (only on a TTY) ──────────────────────────────────
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$(printf '\033[0m')
+  C_BOLD=$(printf '\033[1m')
+  C_DIM=$(printf '\033[2m')
+  C_GREEN=$(printf '\033[32m')
+  C_YELLOW=$(printf '\033[33m')
+  C_RED=$(printf '\033[31m')
+  C_CYAN=$(printf '\033[36m')
+else
+  C_RESET=''; C_BOLD=''; C_DIM=''
+  C_GREEN=''; C_YELLOW=''; C_RED=''; C_CYAN=''
+fi
+
+say()   { printf '%s%s%s\n'   "$C_CYAN"   "→ $*" "$C_RESET" >&2; }
+ok()    { printf '%s%s%s\n'   "$C_GREEN"  "✓ $*" "$C_RESET" >&2; }
+warn()  { printf '%s%s%s\n'   "$C_YELLOW" "! $*" "$C_RESET" >&2; }
+die()   { printf '%s%s%s\n'   "$C_RED"    "✗ $*" "$C_RESET" >&2; exit 1; }
+hr()    { printf '%s%s%s\n'   "$C_DIM"    "$(printf '%.0s─' $(seq 1 60))" "$C_RESET" >&2; }
+banner() {
+  printf '%s\n' "$C_BOLD"
+  cat <<'B'
+   ███████ ██    ██ ███    ██ ████████ ██   ██ ███████ ██   ██
+   ██       ██  ██  ████   ██    ██    ██   ██ ██       ██ ██
+   ███████   ████   ██ ██  ██    ██    ███████ █████     ███
+        ██    ██    ██  ██ ██    ██    ██   ██ ██       ██ ██
+   ███████    ██    ██   ████    ██    ██   ██ ███████ ██   ██
+                                                            hub
+B
+  printf '%s%s   distributed coinductive policy synthesis · synthex.fit%s\n\n' \
+         "$C_DIM" "" "$C_RESET"
+}
+
+# ── prerequisites ───────────────────────────────────────────
+need_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker is not installed."
+    case "$(uname -s)" in
+      Darwin)
+        printf '  Install Docker Desktop:    https://www.docker.com/products/docker-desktop/\n'
+        printf '  Or via Homebrew:           brew install --cask docker\n'
+        ;;
+      Linux)
+        printf '  Get Docker:                https://docs.docker.com/engine/install/\n'
+        ;;
+      *)
+        printf '  See https://docs.docker.com/get-docker/\n'
+        ;;
+    esac
+    die "re-run this installer once Docker is available."
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    die "Docker is installed but not running. Start Docker Desktop (or 'sudo systemctl start docker') and re-run."
+  fi
+  ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '(unknown)') is running."
+}
+
+# ── defaults / detection ────────────────────────────────────
+detect_cores() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc
+  elif command -v sysctl >/dev/null 2>&1; then
+    sysctl -n hw.ncpu 2>/dev/null || echo 4
+  elif command -v getconf >/dev/null 2>&1; then
+    getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4
+  else
+    echo 4
+  fi
+}
+
+prompt_token() {
+  if [ -n "${API_TOKEN:-}" ]; then
+    return 0
+  fi
+  if [ ! -t 0 ]; then
+    die "API_TOKEN not set and stdin is not a TTY. Re-run with: API_TOKEN=… sh -c \"\$(curl -fsSL https://synthex.fit/install)\""
+  fi
+  printf '%sAPI token (ask the operator):%s ' "$C_BOLD" "$C_RESET" >&2
+  # Best-effort silent read; fall back to plain read for /bin/sh.
+  if read -rs API_TOKEN 2>/dev/null; then
+    printf '\n' >&2
+  else
+    read -r API_TOKEN
+  fi
+  [ -n "$API_TOKEN" ] || die "no token provided."
+}
+
+# ── main ────────────────────────────────────────────────────
+banner
+need_docker
+
+SERVER_URL="${SERVER_URL:-https://synthex.fit/api}"
+WORKER_NAME="${WORKER_NAME:-$(hostname 2>/dev/null || echo worker-$$)}"
+POOL_SIZE="${POOL_SIZE:-$(detect_cores)}"
+CONTAINER_NAME="${CONTAINER_NAME:-synthex-worker}"
+
+# Image acquisition mode: explicit IMAGE wins (registry pull); otherwise
+# we build from the git URL. This keeps the default frictionless — the
+# operator never has to publish anywhere.
+BUILD_FROM="${BUILD_FROM:-https://github.com/rcc/synthex-hub.git#main:worker}"
+LOCAL_TAG="${LOCAL_TAG:-synthex-worker:local}"
+
+if [ -n "${IMAGE:-}" ]; then
+  ACQUIRE_MODE=pull
+  RUN_IMAGE="$IMAGE"
+else
+  ACQUIRE_MODE=build
+  RUN_IMAGE="$LOCAL_TAG"
+fi
+
+prompt_token
+
+hr
+printf '  %sserver%s     %s\n' "$C_DIM" "$C_RESET" "$SERVER_URL"
+printf '  %sname%s       %s\n' "$C_DIM" "$C_RESET" "$WORKER_NAME"
+printf '  %spool size%s  %s python interpreters\n' "$C_DIM" "$C_RESET" "$POOL_SIZE"
+if [ "$ACQUIRE_MODE" = pull ]; then
+  printf '  %simage%s      %s %s(pulled from registry)%s\n' \
+    "$C_DIM" "$C_RESET" "$RUN_IMAGE" "$C_DIM" "$C_RESET"
+else
+  printf '  %ssource%s     %s\n' "$C_DIM" "$C_RESET" "$BUILD_FROM"
+  printf '  %simage%s      %s %s(built locally)%s\n' \
+    "$C_DIM" "$C_RESET" "$RUN_IMAGE" "$C_DIM" "$C_RESET"
+fi
+printf '  %scontainer%s  %s\n' "$C_DIM" "$C_RESET" "$CONTAINER_NAME"
+hr
+
+# Reachability sanity check (non-fatal — laptops behind captive portals etc).
+if command -v curl >/dev/null 2>&1; then
+  if curl -fsS --max-time 5 "${SERVER_URL%/api}/health" >/dev/null 2>&1; then
+    ok "Hub is reachable."
+  else
+    warn "Could not reach ${SERVER_URL%/api}/health — proceeding anyway."
+  fi
+fi
+
+# Acquire the image.
+case "$ACQUIRE_MODE" in
+  pull)
+    say "Pulling ${RUN_IMAGE}…"
+    if ! docker pull "$RUN_IMAGE"; then
+      die "could not pull $RUN_IMAGE. If the image is private, ask the operator to grant access or set BUILD_FROM=… to build from source instead."
+    fi
+    ;;
+  build)
+    say "Building ${RUN_IMAGE} from ${BUILD_FROM} (one-time, ~3-5 min)…"
+    say "Subsequent installs reuse the layer cache; faster after the first run."
+    if ! docker build --tag "$RUN_IMAGE" --pull "$BUILD_FROM"; then
+      die "build failed. Common causes:
+  • outbound HTTPS to github.com is blocked
+  • the repo at $BUILD_FROM is not publicly accessible
+  • disk full
+
+If the worker repo is private, set IMAGE=… to use a registry image,
+or BUILD_FROM=… to point at a fork/mirror you control."
+    fi
+    ;;
+esac
+
+# Stop + remove any prior container so re-running is idempotent.
+if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+  say "Removing existing container ‘${CONTAINER_NAME}’…"
+  docker rm -f "$CONTAINER_NAME" >/dev/null
+fi
+
+# Launch.
+say "Starting worker…"
+CONTAINER_ID=$(
+  docker run -d \
+    --name "$CONTAINER_NAME" \
+    --restart unless-stopped \
+    -e SERVER_URL="$SERVER_URL" \
+    -e API_TOKEN="$API_TOKEN" \
+    -e WORKER_NAME="$WORKER_NAME" \
+    -e POOL_SIZE="$POOL_SIZE" \
+    "$RUN_IMAGE"
+)
+
+# Give it a moment, then check it's still running.
+sleep 2
+if ! docker ps --filter "id=$CONTAINER_ID" --format '{{.ID}}' | grep -q .; then
+  warn "Container exited immediately. Last 30 log lines:"
+  docker logs --tail 30 "$CONTAINER_NAME" >&2 || true
+  die "worker failed to start."
+fi
+
+ok "Worker ${C_BOLD}${WORKER_NAME}${C_RESET}${C_GREEN} is connected.${C_RESET}"
+hr
+cat <<EOF >&2
+Useful commands:
+
+  ${C_BOLD}docker logs -f ${CONTAINER_NAME}${C_RESET}${C_DIM}     # tail logs${C_RESET}
+  ${C_BOLD}docker stats ${CONTAINER_NAME}${C_RESET}${C_DIM}       # cpu / memory${C_RESET}
+  ${C_BOLD}docker stop ${CONTAINER_NAME}${C_RESET}${C_DIM}        # pause donating compute${C_RESET}
+  ${C_BOLD}docker rm -f ${CONTAINER_NAME}${C_RESET}${C_DIM}       # uninstall${C_RESET}
+
+EOF
+if [ "$ACQUIRE_MODE" = build ]; then
+  cat <<EOF >&2
+To update to the latest worker code:
+
+  ${C_BOLD}docker rm -f ${CONTAINER_NAME}${C_RESET}
+  ${C_BOLD}curl -fsSL ${SERVER_URL%/api}/install | sh${C_RESET}${C_DIM}
+                                # rebuilds from the latest commit${C_RESET}
+
+EOF
+fi
+cat <<EOF >&2
+Watch the cluster:
+
+  ${C_BOLD}open ${SERVER_URL%/api}/${C_RESET}${C_DIM}              # landing page${C_RESET}
+
+EOF

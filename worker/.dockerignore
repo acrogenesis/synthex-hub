@@ -1,0 +1,13 @@
+_build
+deps
+.elixir_ls
+.git
+.gitignore
+.idea
+.vscode
+*.beam
+erl_crash.dump
+node_modules
+test
+docker-compose.yml
+priv/static

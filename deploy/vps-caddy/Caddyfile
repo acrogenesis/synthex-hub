@@ -1,0 +1,27 @@
+{
+  email you@example.com
+}
+
+# Public TLS reverse proxy. Caddy handles ACME / Let's Encrypt
+# automatically; on first boot it'll issue a cert for synthex.fit.
+synthex.fit {
+  encode zstd gzip
+
+  # Anything under /api or /health goes to the upstream Hub. The Hub
+  # itself enforces the API_TOKEN; Caddy is just terminating TLS and
+  # smoothing requests over the WireGuard tunnel.
+  reverse_proxy http://127.0.0.1:4000 {
+    header_up X-Forwarded-Host {host}
+    header_up X-Real-IP {remote_host}
+    transport http {
+      keepalive 30s
+      response_header_timeout 120s
+      read_timeout 120s
+      write_timeout 120s
+    }
+  }
+
+  log {
+    output file /var/log/caddy/synthex.fit.log
+  }
+}

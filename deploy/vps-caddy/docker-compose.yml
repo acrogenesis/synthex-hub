@@ -1,0 +1,46 @@
+# Run on your laptop / home box. Caddy + WireGuard live on the VPS.
+#
+# This compose file is identical to ../cloudflared/docker-compose.yml
+# minus the cloudflared service. The Hub is reached via WireGuard
+# from the VPS, which terminates TLS and reverse-proxies to it.
+name: synthex-hub-origin
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-synthex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB:       ${POSTGRES_DB:-synthex_hub}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  server:
+    build:
+      context: ../../server
+      dockerfile: Dockerfile
+    image: synthex-hub-server:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Bind the listener to the WireGuard interface only; never expose
+    # 4000 to the public internet directly. Replace 10.7.0.2 with the
+    # WireGuard IP of this machine.
+    ports:
+      - "10.7.0.2:4000:4000"
+    environment:
+      MIX_ENV: prod
+      DATABASE_URL: postgres://${POSTGRES_USER:-synthex}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-synthex_hub}
+      WAIT_FOR_DB: postgres:5432
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env}
+      PORT: "4000"
+
+volumes:
+  pgdata:

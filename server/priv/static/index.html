@@ -418,8 +418,11 @@
         (<code class="inline">docker build https://&hellip;.git#main:worker</code>) —
         no registry, no clone,</li>
       <li>start a worker bound to <code class="inline">SERVER_URL=https://synthex.fit/api</code>,</li>
-      <li>configure a pool of one Python interpreter per CPU core
-        (override with <code class="inline">POOL_SIZE=N</code>).</li>
+      <li>ask you what fraction of your CPU cores to donate
+        (default 50%); one Python interpreter is started per
+        donated core. Override the prompt with
+        <code class="inline">DONATE_PCT=25</code> or skip it
+        entirely with <code class="inline">POOL_SIZE=N</code>.</li>
     </ul>
 
     <p>To stop:</p>

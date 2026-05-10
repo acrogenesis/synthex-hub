@@ -20,7 +20,14 @@
 #                        default: prompted (suggesting $USER@$(hostname));
 #                        type "anonymous" or leave blank to opt out
 #                        of recognition.
-#     POOL_SIZE          default: number of CPU cores
+#     POOL_SIZE          absolute number of python interpreters to run.
+#                        when set, takes priority over DONATE_PCT and
+#                        skips the interactive "% of cores" prompt.
+#     DONATE_PCT         percent of CPU cores to donate (1-100).
+#                        used only if POOL_SIZE is unset.
+#                        default: prompted (suggesting 50%); skipped
+#                        in NONINTERACTIVE mode where it falls back
+#                        to 50%.
 #     CONTAINER_NAME     default: synthex-worker
 #     VOLUME_NAME        named docker volume that persists the stable
 #                        worker_id (UUID) across restarts so per-worker
@@ -119,9 +126,16 @@ banner
 need_docker
 
 SERVER_URL="${SERVER_URL:-https://synthex.fit/api}"
-POOL_SIZE="${POOL_SIZE:-$(detect_cores)}"
+TOTAL_CORES="$(detect_cores)"
 CONTAINER_NAME="${CONTAINER_NAME:-synthex-worker}"
 VOLUME_NAME="${VOLUME_NAME:-synthex-worker-data}"
+
+# Default donation percentage. Picked low on purpose: pegging
+# someone's laptop at 100% on the first install is a great way to
+# guarantee they uninstall five minutes later. They can dial it up
+# (or pass POOL_SIZE explicitly) once they've confirmed nothing
+# catches fire.
+DEFAULT_DONATE_PCT=50
 
 # Prompt for a display name unless one was passed via env / NONINTERACTIVE
 # is set. The default suggestion is $USER@$(hostname); an empty answer
@@ -140,6 +154,57 @@ if [ -z "${WORKER_NAME:-}" ] && [ -z "${NONINTERACTIVE:-}" ] && [ -t 0 ]; then
 fi
 # Final fallback for non-interactive cases.
 WORKER_NAME="${WORKER_NAME:-anonymous}"
+
+# Resolve POOL_SIZE.
+#   1. POOL_SIZE explicitly set in env → honor it verbatim.
+#   2. else interactive shell → prompt for donation %, default 50.
+#   3. else non-interactive → DONATE_PCT env var, default 50.
+# In every branch we end up with a positive integer in POOL_SIZE.
+resolve_pool_size() {
+  if [ -n "${POOL_SIZE:-}" ]; then
+    return 0
+  fi
+
+  pct=""
+  if [ -z "${DONATE_PCT:-}" ] && [ -z "${NONINTERACTIVE:-}" ] && [ -t 0 ]; then
+    printf '\n%sHow much of this machine to donate?%s\n' "$C_BOLD" "$C_RESET" >&2
+    printf '%s  detected %s CPU cores. one python interpreter per donated core.%s\n' \
+      "$C_DIM" "$TOTAL_CORES" "$C_RESET" >&2
+    printf '%s  · enter a percent 1-100 (e.g. 25, 50, 75)%s\n' "$C_DIM" "$C_RESET" >&2
+    printf '%s  · press ENTER for the default — you can change it any time%s\n' "$C_DIM" "$C_RESET" >&2
+
+    while :; do
+      printf '\n  cores to donate [%s%s%%%s]: ' "$C_BOLD" "$DEFAULT_DONATE_PCT" "$C_RESET" >&2
+      read -r entered_pct </dev/tty || entered_pct=""
+      entered_pct="${entered_pct%\%}"
+      if [ -z "$entered_pct" ]; then
+        pct="$DEFAULT_DONATE_PCT"
+        break
+      fi
+      case "$entered_pct" in
+        ''|*[!0-9]*)
+          warn "please enter an integer 1-100 (e.g. 50)"
+          continue
+          ;;
+      esac
+      if [ "$entered_pct" -ge 1 ] && [ "$entered_pct" -le 100 ]; then
+        pct="$entered_pct"
+        break
+      fi
+      warn "out of range — please enter 1-100"
+    done
+  else
+    pct="${DONATE_PCT:-$DEFAULT_DONATE_PCT}"
+  fi
+
+  POOL_SIZE=$(( TOTAL_CORES * pct / 100 ))
+  if [ "$POOL_SIZE" -lt 1 ]; then
+    POOL_SIZE=1
+  fi
+  DONATE_PCT_RESOLVED="$pct"
+}
+
+resolve_pool_size
 
 # Image acquisition mode: explicit IMAGE wins (registry pull); otherwise
 # we build from the git URL. This keeps the default frictionless — the
@@ -162,7 +227,13 @@ if [ "$WORKER_NAME" = "anonymous" ]; then
   printf ' %s(opted out of recognition)%s' "$C_DIM" "$C_RESET"
 fi
 printf '\n'
-printf '  %spool size%s  %s python interpreters\n' "$C_DIM" "$C_RESET" "$POOL_SIZE"
+if [ -n "${DONATE_PCT_RESOLVED:-}" ]; then
+  printf '  %spool size%s  %s python interpreters %s(%s%% of %s detected cores)%s\n' \
+    "$C_DIM" "$C_RESET" "$POOL_SIZE" "$C_DIM" "$DONATE_PCT_RESOLVED" "$TOTAL_CORES" "$C_RESET"
+else
+  printf '  %spool size%s  %s python interpreters %s(POOL_SIZE override; %s cores detected)%s\n' \
+    "$C_DIM" "$C_RESET" "$POOL_SIZE" "$C_DIM" "$TOTAL_CORES" "$C_RESET"
+fi
 printf '  %sid volume%s  %s %s(persists worker_id across restarts)%s\n' \
   "$C_DIM" "$C_RESET" "$VOLUME_NAME" "$C_DIM" "$C_RESET"
 if [ "$ACQUIRE_MODE" = pull ]; then

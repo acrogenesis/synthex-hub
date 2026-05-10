@@ -96,7 +96,7 @@ defmodule Server.Queue do
         job_changesets
         |> Enum.chunk_every(500)
         |> Enum.each(fn batch_chunks ->
-          {_count, _jobs} = Oban.insert_all(batch_chunks)
+          _jobs = Oban.insert_all(batch_chunks)
         end)
       end
 

@@ -144,6 +144,11 @@ defmodule Server.Queue do
   jump ahead.
   """
   def claim_chunk(worker_id) do
+    # Within the same rank-within-batch, break ties RANDOMLY across
+    # batches so concurrent batches get equal-share of worker time
+    # rather than letting whichever batch was submitted first
+    # consume all worker capacity (older `scheduled_at` would
+    # always win otherwise).
     sql = """
     WITH ranked AS (
       SELECT
@@ -160,7 +165,7 @@ defmodule Server.Queue do
     FROM oban_jobs j
     JOIN ranked r ON r.id = j.id
     WHERE j.state = 'available' AND j.queue = 'chunks'
-    ORDER BY j.priority ASC, r.rn ASC, j.scheduled_at ASC, j.id ASC
+    ORDER BY j.priority ASC, r.rn ASC, random()
     LIMIT 1
     FOR UPDATE OF j SKIP LOCKED
     """

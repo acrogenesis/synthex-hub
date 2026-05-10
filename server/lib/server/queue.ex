@@ -89,8 +89,15 @@ defmodule Server.Queue do
           BrokerWorker.new(args, meta: %{"chunk_id" => chunk_id, "batch_id" => batch_id})
         end)
 
+      # Postgres caps a single statement at 65535 bind parameters.
+      # An Oban.Job carries ~30 columns, so we keep each insert_all
+      # call comfortably under that with batches of 500 jobs.
       if total_chunks > 0 do
-        {_count, _jobs} = Oban.insert_all(job_changesets)
+        job_changesets
+        |> Enum.chunk_every(500)
+        |> Enum.each(fn batch_chunks ->
+          {_count, _jobs} = Oban.insert_all(batch_chunks)
+        end)
       end
 
       if total_chunks == 0 do

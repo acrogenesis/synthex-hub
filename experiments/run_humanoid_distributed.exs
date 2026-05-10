@@ -7,8 +7,13 @@
 # Prereqs and launch: see run_ant_distributed.exs.
 
 Mix.install([
-  {:synthex,            path: Path.expand("../../synthex", __DIR__)},
-  {:synthex_hub_client, path: Path.expand("../client",     __DIR__)}
+  {:synthex,
+   git: "https://github.com/doctorcorral/synthex.git",
+   ref: System.get_env("SYNTHEX_GIT_REF", "main")},
+  {:synthex_hub_client,
+   git: "https://github.com/doctorcorral/synthex-hub.git",
+   subdir: "client",
+   ref: System.get_env("SYNTHEX_HUB_GIT_REF", "main")}
 ])
 
 client = Synthex.Hub.Client.new()

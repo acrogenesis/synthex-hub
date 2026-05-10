@@ -1,10 +1,15 @@
 # Distributed experiments
 
 Each `.exs` file in this directory is a self-contained master driver:
-a CSHRL synthesis loop that submits its heavy candidate-scoring work to
-the hub running at `synthex.fit` (or wherever `SYNTHEX_HUB_URL`
-points). They use `Mix.install` so you don't need to set up an Elixir
-project — just have Elixir 1.18+ on the PATH.
+a thin CSHRL synthesis coordinator that submits **every** Python /
+Gymnasium / MuJoCo call to the hub running at `synthex.fit` (or
+wherever `SYNTHEX_HUB_URL` points). They use `Mix.install` so you don't
+need to set up an Elixir project — just have Elixir 1.18+ on the PATH.
+
+> **Master is Python-free.** Both `score_bit` and `collect_states` are
+> distributed; the master only runs the CEGAR loop in pure Elixir. You
+> can drive a Humanoid synthesis from a small laptop or even a free Fly
+> machine. All the MuJoCo work happens on the worker swarm.
 
 ## Layout
 
@@ -56,8 +61,13 @@ file.
 
 ```elixir
 Mix.install([
-  {:synthex,            path: Path.expand("../../synthex", __DIR__)},
-  {:synthex_hub_client, path: Path.expand("../client",     __DIR__)}
+  {:synthex,
+   git: "https://github.com/doctorcorral/synthex.git",
+   ref: System.get_env("SYNTHEX_GIT_REF", "main")},
+  {:synthex_hub_client,
+   git: "https://github.com/doctorcorral/synthex-hub.git",
+   subdir: "client",
+   ref: System.get_env("SYNTHEX_HUB_GIT_REF", "main")}
 ])
 
 scorer = Synthex.Hub.Scorer.new(env_key: :YOUR_ENV)
@@ -67,6 +77,10 @@ Synthex.Gym.Mujoco.solve(:YOUR_ENV,
   ...
 )
 ```
+
+Both deps are pulled from public GitHub, so collaborators don't need a
+local checkout of either project to run an experiment — just the
+`.exs` file.
 
 Three things to check off before running:
 
@@ -82,8 +96,23 @@ Three things to check off before running:
 ## Local sanity check (no hub)
 
 To make sure your master logic is correct before involving the hub,
-just run the equivalent script in `synthex/experiments/` directly — it
-defaults to `Synthex.Scoring.LocalPython` which forks `python3` for
-each oracle call. For HalfCheetah, this finishes in minutes on a
-laptop. For Ant or Humanoid it doesn't finish at all, which is exactly
-why the hub exists.
+clone `synthex` and run an experiment from
+[doctorcorral/synthex/experiments](https://github.com/doctorcorral/synthex/tree/main/experiments)
+directly — it defaults to `Synthex.Scoring.LocalPython` which forks
+`python3` for each oracle call. For HalfCheetah, this finishes in
+minutes on a laptop. For Ant or Humanoid it doesn't finish at all,
+which is exactly why the hub exists.
+
+## Local development against an unpublished synthex branch
+
+Set `SYNTHEX_PATH` to a checkout and the client + experiments will
+prefer that path over the public git tag:
+
+```sh
+export SYNTHEX_PATH=/abs/path/to/synthex   # picked up by client/mix.exs
+mix run experiments/run_ant_distributed.exs
+```
+
+(This only works for `mix run` against `client/`. The Mix.install
+scripts always use git refs; pin a specific commit via
+`SYNTHEX_GIT_REF=<sha>`.)

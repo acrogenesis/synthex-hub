@@ -7,7 +7,9 @@ line on stdout. ALWAYS produces a response containing the original
 `job_id`, even on errors, so the Elixir port never hangs waiting.
 
 Supported commands:
-  - score_bit      (default; binary-weighted continuous control)
+  - score_bit       (default; binary-weighted continuous control)
+  - collect_states  (rollout episodes with a fixed bit-policy and
+                     return the visited states; one job-unit per seed)
 
 Future commands map onto the same protocol; just add a dispatch case.
 """
@@ -176,8 +178,67 @@ def handle_score_bit(job):
     return results
 
 
+# ── collect_states command ──────────────────────────────────────────
+#
+# `candidates` is a list of seeds. For each seed we roll out a single
+# episode under the given `bit_predicates` and emit one result entry
+# carrying the visited states + a per-episode success flag. The master
+# concatenates results across all chunks to reconstruct the full state
+# pool.
+
+
+def collect_states_one(env_name, seed, bit_preds, max_steps, bits_per_dim):
+    cfg = ENV_CONFIGS[env_name]
+    env_kwargs = cfg.get("env_kwargs", {})
+    env = gym.make(env_name, **env_kwargs)
+    try:
+        obs, _ = env.reset(seed=int(seed))
+        states = []
+        ep_r = 0.0
+        for _ in range(max_steps):
+            states.append(obs.tolist())
+            action = bit_policy_action(bit_preds, obs.tolist(), cfg, bits_per_dim)
+            obs, r, term, trunc, _ = env.step(action)
+            ep_r += float(r)
+            if term or trunc:
+                break
+    finally:
+        env.close()
+
+    return {
+        "seed": int(seed),
+        "states": states,
+        "reward": ep_r,
+        "success": ep_r > cfg["success_threshold"],
+    }
+
+
+def handle_collect_states(job):
+    env_name = job["env_name"]
+    if env_name not in ENV_CONFIGS:
+        raise ValueError(f"unknown env_name: {env_name}; known={list(ENV_CONFIGS)}")
+
+    seeds = job.get("candidates") or job.get("seeds") or [0]
+    bit_preds = job.get("bit_predicates", [])
+    max_steps = int(job.get("max_steps", 1000))
+    bits_per_dim = int(job.get("bits_per_dim", 3))
+
+    results = []
+    for i, seed in enumerate(seeds):
+        try:
+            r = collect_states_one(env_name, seed, bit_preds, max_steps, bits_per_dim)
+            r["idx"] = i
+        except Exception as e:
+            log.exception("collect_states seed=%s failed", seed)
+            r = {"idx": i, "seed": int(seed), "error": f"{type(e).__name__}: {e}",
+                 "states": [], "reward": 0.0, "success": False}
+        results.append(r)
+    return results
+
+
 COMMANDS = {
     "score_bit": handle_score_bit,
+    "collect_states": handle_collect_states,
 }
 
 

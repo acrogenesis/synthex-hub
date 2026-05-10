@@ -20,8 +20,13 @@ other way around.
 ```elixir
 # inside an experiment .exs file
 Mix.install([
-  {:synthex,            path: Path.expand("../../synthex", __DIR__)},
-  {:synthex_hub_client, path: Path.expand("../client",     __DIR__)}
+  {:synthex,
+   git: "https://github.com/doctorcorral/synthex.git",
+   ref: System.get_env("SYNTHEX_GIT_REF", "main")},
+  {:synthex_hub_client,
+   git: "https://github.com/doctorcorral/synthex-hub.git",
+   subdir: "client",
+   ref: System.get_env("SYNTHEX_HUB_GIT_REF", "main")}
 ])
 
 scorer =
@@ -53,17 +58,20 @@ See [`../experiments/`](../experiments) for ready-to-run scripts.
 `Synthex.Hub.Scorer.new/1` returns a 1-arg function — a value of
 type `Synthex.Scoring.t()`. Internally:
 
-  * `cmd: "score_bit"` requests are POSTed to `/api/master/batches`,
-    chunked across whoever's connected, and polled until done. The
-    master gets back `{:ok, %{"scores" => [...], "baseline_reward" => f}}`.
-  * Every other command (`collect_states`, `validate`, ...) falls
-    through to a local Python scorer (default
-    `Synthex.Scoring.LocalPython`) so the master still needs
-    `gymnasium` + the relevant physics backend installed locally.
+  * `cmd: "score_bit"` — chunked across the worker swarm, K candidates
+    per chunk × N seeds per candidate. Master gets back
+    `{:ok, %{"scores" => [...], "baseline_reward" => f}}`.
+  * `cmd: "collect_states"` — chunked across the worker swarm, one
+    rollout episode per seed. Master gets back
+    `{:ok, %{"states" => [[float]], "n_landings" => i, "n_episodes" => i}}`.
+  * Anything else hits a `:fallback` function. The default fallback
+    raises a clear error — the master is intentionally Python-free.
+    Override with `:fallback` if you want local execution for some
+    custom command.
 
-This split is intentional: only `score_bit` is large enough to
-benefit from distribution. Trajectory collection and validation are
-fast and serial.
+The master never invokes Python. You can drive synthesis from a tiny
+laptop or a free-tier cloud VM; all the simulation work runs on
+collaborators' machines.
 
 ## Auth
 
@@ -75,10 +83,9 @@ fast and serial.
 
 ## Configuration
 
-| Env var              | Default                       | Notes                                |
-|----------------------|-------------------------------|--------------------------------------|
-| `SYNTHEX_HUB_URL`    | `https://synthex.fit/api`     | Trailing `/` is fine either way.     |
-| `SYNTHEX_HUB_TOKEN`  | _(none)_                      | Required for `Hub.Client.score_bit`. |
-| `SYNTHEX_PATH`       | `../../synthex`               | Path to synthex checkout, used by    |
-|                      |                               | this lib's `mix.exs` deps. Override  |
-|                      |                               | if your layout is different.         |
+| Env var              | Default                                          | Notes                                                                                |
+|----------------------|--------------------------------------------------|--------------------------------------------------------------------------------------|
+| `SYNTHEX_HUB_URL`    | `https://synthex.fit/api`                        | Trailing `/` is fine either way.                                                     |
+| `SYNTHEX_HUB_TOKEN`  | _(none)_                                         | Required for `Hub.Client.score_bit` and `collect_states`.                            |
+| `SYNTHEX_GIT_REF`    | `main`                                           | Pins the synthex revision used by `mix.exs`. Set to a commit SHA or tag for repro.   |
+| `SYNTHEX_PATH`       | _(unset → falls back to git)_                    | If set to an abs path, `mix.exs` uses a local checkout instead of pulling from git.  |

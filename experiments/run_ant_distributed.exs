@@ -13,13 +13,19 @@
 #
 # Master prerequisites:
 #   * Elixir 1.18+
-#   * Python 3 with `gymnasium`, `mujoco` installed locally — needed
-#     for the small `collect_states` and `validate` calls that run
-#     in-process (only the heavy `score_bit` work is farmed out).
+#
+# Notably, NO Python on the master. Every oracle call (collect_states,
+# score_bit, validate) is dispatched to the hub's worker swarm. The
+# only thing this script does locally is the CEGAR loop in pure Elixir.
 
 Mix.install([
-  {:synthex,            path: Path.expand("../../synthex", __DIR__)},
-  {:synthex_hub_client, path: Path.expand("../client",     __DIR__)}
+  {:synthex,
+   git: "https://github.com/doctorcorral/synthex.git",
+   ref: System.get_env("SYNTHEX_GIT_REF", "main")},
+  {:synthex_hub_client,
+   git: "https://github.com/doctorcorral/synthex-hub.git",
+   subdir: "client",
+   ref: System.get_env("SYNTHEX_HUB_GIT_REF", "main")}
 ])
 
 # Pre-flight: how big is the cluster right now?

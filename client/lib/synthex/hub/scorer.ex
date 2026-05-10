@@ -1,16 +1,19 @@
 defmodule Synthex.Hub.Scorer do
   @moduledoc """
-  A `Synthex.Scoring` implementation that distributes the heavy
-  `score_bit` workload to a [Synthex Hub](https://synthex.fit) and
-  delegates everything else (state collection, validation,
-  trajectory exploration) to a local fallback scorer.
+  A `Synthex.Scoring` implementation that distributes ALL oracle calls
+  to a [Synthex Hub](https://synthex.fit). The master is a thin Elixir
+  coordinator: no Python, no Gymnasium, no MuJoCo — every state
+  collection, candidate scoring, and validation episode runs on the
+  worker swarm.
 
-  ## Why split
+  ## Supported commands
 
-  In the CEGAR loop, only `score_bit` calls are large (50 episodes ×
-  thousands of candidates). Everything else (`collect_states`,
-  `validate`) is small and fast and runs against the master's local
-  Python — no point round-tripping through HTTP for those.
+    * `score_bit`      — distributed: one chunk == K candidates × N seeds
+    * `collect_states` — distributed: one chunk == K seeds (rollouts)
+
+  Both go through `Synthex.Hub.Client`'s submit-and-poll path on top of
+  the same Oban-backed batch queue, so they reuse all the same
+  retries / lifelines / contributor accounting.
 
   ## Usage
 
@@ -29,9 +32,10 @@ defmodule Synthex.Hub.Scorer do
 
   ## Custom fallback
 
-  Pass `:fallback` to override the local scorer used for non-`score_bit`
-  commands. Defaults to `Synthex.Scoring.LocalPython.scorer(env_key: env_key)`.
-  Useful for tests, dry-runs, or hooking in alternative simulators.
+  Pass `:fallback` to override the scorer used for any command the hub
+  scorer does NOT know how to dispatch. Defaults to a function that
+  raises — keeping the master Python-free by construction. Tests
+  override this with stubs.
   """
 
   alias Synthex.Hub.Client
@@ -42,15 +46,19 @@ defmodule Synthex.Hub.Scorer do
 
   ## Options
 
-    * `:env_key` — required. Used by the local fallback to find the
-      Python oracle script.
+    * `:env_key` — required. Tagged onto each batch for accounting;
+      passed to the fallback if you provide one.
     * `:url`, `:token` — passed through to `Synthex.Hub.Client.new/1`.
     * `:chunk_size`, `:poll_interval_ms`, `:request_timeout_ms`,
       `:max_wait_ms` — all forwarded to `Synthex.Hub.Client`.
     * `:batch_name_prefix` — prepended to each batch's auto-generated
       name (used for grouping in the hub's UI).
-    * `:fallback` — a `Synthex.Scoring.t()` for non-`score_bit`
-      commands. Defaults to `LocalPython` for `env_key`.
+    * `:collect_states_chunk_size` — independent chunk size for the
+      `collect_states` command (defaults to 4 seeds per chunk, since
+      one rollout episode is much heavier than scoring one candidate).
+    * `:fallback` — a `Synthex.Scoring.t()` invoked for any command
+      the hub doesn't know how to handle. Defaults to a function that
+      raises.
   """
   @spec new(keyword()) :: Synthex.Scoring.t()
   def new(opts) do
@@ -66,9 +74,26 @@ defmodule Synthex.Hub.Scorer do
         max_wait_ms: Keyword.get(opts, :max_wait_ms, 24 * 60 * 60 * 1000)
       )
 
+    collect_chunk_size = Keyword.get(opts, :collect_states_chunk_size, 4)
+
+    collect_client =
+      Client.new(
+        url: Keyword.get(opts, :url),
+        token: Keyword.get(opts, :token),
+        chunk_size: collect_chunk_size,
+        poll_interval_ms: Keyword.get(opts, :poll_interval_ms, 5_000),
+        request_timeout_ms: Keyword.get(opts, :request_timeout_ms, 30_000),
+        max_wait_ms: Keyword.get(opts, :max_wait_ms, 24 * 60 * 60 * 1000)
+      )
+
     fallback =
       Keyword.get(opts, :fallback) ||
-        Synthex.Scoring.LocalPython.scorer(env_key: env_key)
+        fn request ->
+          {:error,
+           "Synthex.Hub.Scorer received an unsupported command " <>
+             "(#{inspect(Map.get(request, "cmd"))}). Pass `:fallback` to " <>
+             "Synthex.Hub.Scorer.new/1 if you need local execution."}
+        end
 
     batch_prefix =
       Keyword.get(
@@ -77,10 +102,20 @@ defmodule Synthex.Hub.Scorer do
         "#{env_key}-#{:erlang.system_time(:second)}"
       )
 
-    fn request -> dispatch(request, client, fallback, batch_prefix) end
+    state = %{
+      score_client: client,
+      collect_client: collect_client,
+      fallback: fallback,
+      batch_prefix: batch_prefix
+    }
+
+    fn request -> dispatch(request, state) end
   end
 
-  defp dispatch(%{"cmd" => "score_bit"} = request, client, _fallback, batch_prefix) do
+  defp dispatch(%{"cmd" => "score_bit"} = request, %{
+         score_client: client,
+         batch_prefix: batch_prefix
+       }) do
     target_bit = request["target_bit"]
     batch_name = "#{batch_prefix}-bit#{target_bit}"
 
@@ -98,10 +133,27 @@ defmodule Synthex.Hub.Scorer do
     end
   end
 
-  # Everything else (collect_states, score, explore, ...) is small
-  # and stays on the master's local Python. The hub's worker oracle
-  # only knows score_bit anyway.
-  defp dispatch(request, _client, fallback, _batch_prefix) do
+  defp dispatch(%{"cmd" => "collect_states"} = request, %{
+         collect_client: client,
+         batch_prefix: batch_prefix
+       }) do
+    batch_name = "#{batch_prefix}-collect"
+
+    case Client.collect_states(client, request, batch_name: batch_name) do
+      {:ok, %{states: states, n_landings: n_landings, n_episodes: n_episodes}} ->
+        {:ok,
+         %{
+           "states" => states,
+           "n_landings" => n_landings,
+           "n_episodes" => n_episodes
+         }}
+
+      {:error, reason} ->
+        {:error, "Synthex.Hub.Scorer: collect_states batch failed: #{reason}"}
+    end
+  end
+
+  defp dispatch(request, %{fallback: fallback}) do
     fallback.(request)
   end
 end

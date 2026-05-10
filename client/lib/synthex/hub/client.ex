@@ -114,6 +114,68 @@ defmodule Synthex.Hub.Client do
     end
   end
 
+  @doc """
+  Submit a `collect_states` batch (one job-unit per seed) and block
+  until completion.
+
+  Returns `{:ok, %{states: [[float]], n_landings: int, n_episodes: int,
+  batch_id: string}}` — the same shape that `Synthex.Gym.Mujoco`'s
+  `collect_states/2` historically produced via local Python, just
+  rebuilt by concatenating per-seed states from the worker swarm.
+
+  `payload` MUST contain `env_name`, `bit_predicates`, `bits_per_dim`,
+  `seeds` (a list of ints), and `max_steps`.
+  """
+  def collect_states(%__MODULE__{} = client, payload, opts \\ []) do
+    name =
+      Keyword.get(
+        opts,
+        :batch_name,
+        "synthex-collect-#{:erlang.system_time(:millisecond)}"
+      )
+
+    seeds = payload["seeds"] || []
+
+    if seeds == [] do
+      {:error, "collect_states: payload[\"seeds\"] must be a non-empty list"}
+    else
+      body =
+        payload
+        |> Map.put("name", name)
+        |> Map.put("cmd", "collect_states")
+        |> Map.put("chunk_size", client.chunk_size)
+        |> Map.put("candidates", seeds)
+        |> Map.delete("seeds")
+
+      with {:ok, batch_id, total_chunks} <- submit_batch(client, body),
+           _ =
+             Logger.info(
+               "[Hub] collect_states batch #{batch_id}: " <>
+                 "#{total_chunks} chunks, #{length(seeds)} seeds"
+             ),
+           {:ok, results} <- await_batch(client, batch_id) do
+        items =
+          results
+          |> Enum.sort_by(fn chunk -> chunk["chunk_index"] end)
+          |> Enum.flat_map(fn chunk -> chunk["items"] end)
+
+        states =
+          Enum.flat_map(items, fn item -> Map.get(item, "states", []) end)
+
+        n_landings =
+          Enum.count(items, fn item -> Map.get(item, "success", false) end)
+
+        {:ok,
+         %{
+           states: states,
+           n_landings: n_landings,
+           n_episodes: length(items),
+           batch_id: batch_id
+         }}
+      end
+    end
+  end
+
   @doc "Submit a batch payload. Returns `{:ok, batch_id, total_chunks}`."
   def submit_batch(%__MODULE__{} = client, payload) do
     case Req.post(url(client, "/master/batches"),

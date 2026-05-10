@@ -21,13 +21,25 @@ defmodule SynthexHubClient.MixProject do
 
   defp deps do
     [
-      # Master driver — your synthesis loop. Pulled by path so this lib
-      # works against an arbitrary local checkout. Swap for `git:` if
-      # you ever publish synthex.
-      {:synthex, path: System.get_env("SYNTHEX_PATH", "../../synthex")},
+      # Master driver — the CSHRL synthesis library. Public repo;
+      # override with SYNTHEX_GIT_REF to pin a different commit/tag
+      # while debugging. For local development against an unpublished
+      # branch, set SYNTHEX_PATH=/abs/path/to/synthex.
+      synthex_dep(),
       {:req, "~> 0.5"},
       {:jason, "~> 1.4"}
     ]
+  end
+
+  defp synthex_dep do
+    case System.get_env("SYNTHEX_PATH") do
+      path when is_binary(path) and path != "" ->
+        {:synthex, path: path}
+
+      _ ->
+        ref = System.get_env("SYNTHEX_GIT_REF", "main")
+        {:synthex, git: "https://github.com/doctorcorral/synthex.git", ref: ref}
+    end
   end
 
   defp description do

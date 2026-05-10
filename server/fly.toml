@@ -36,4 +36,9 @@ primary_region = 'iad'
 [[vm]]
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 512
+  # Bumped from 512 MB to 2 GB. Master `score_bit` batches can carry
+  # tens of thousands of candidate predicates; decoding the JSON body
+  # in BEAM is roughly 5–10× the source size, so 30 MB raw → ~250 MB
+  # transient allocation. 512 MB was OOM'ing the VM (returned as 502
+  # to the client). 2 GB gives us a 100+ MB body headroom.
+  memory_mb = 2048

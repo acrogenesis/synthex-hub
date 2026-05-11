@@ -27,7 +27,8 @@ defmodule SynthexHubClient.MixProject do
       # branch, set SYNTHEX_PATH=/abs/path/to/synthex.
       synthex_dep(),
       {:req, "~> 0.5"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:telemetry, "~> 1.2"}
     ]
   end
 

@@ -51,6 +51,12 @@ scorer =
     poll_interval_ms: 5_000
   )
 
+# Publish a fresh policy snapshot to the hub on every accepted
+# CEGAR bit, so visitors to synthex.fit can click the Ant card
+# and read the current Python pseudocode. Snapshot push failures
+# are logged but never crash the master.
+:ok = Synthex.Hub.Telemetry.attach_snapshot_publisher(client, handler_id: "ant-snapshot-push")
+
 Synthex.Gym.Mujoco.solve(:ant,
   scorer: scorer,
   bits_per_dim: 3,

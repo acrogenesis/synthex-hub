@@ -43,6 +43,11 @@ scorer =
     poll_interval_ms: 10_000
   )
 
+# Publish snapshots on every accepted CEGAR bit — see the Ant
+# script for details. Independent handler id so both runs can
+# coexist on the same node.
+:ok = Synthex.Hub.Telemetry.attach_snapshot_publisher(client, handler_id: "humanoid-snapshot-push")
+
 Synthex.Gym.Mujoco.solve(:humanoid,
   scorer: scorer,
   bits_per_dim: 3,

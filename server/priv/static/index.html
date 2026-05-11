@@ -168,6 +168,64 @@
       border-radius: 8px;
       padding: 14px 16px;
       display: flex; flex-direction: column; gap: 10px;
+      cursor: pointer;
+      transition: border-color 0.15s ease, transform 0.15s ease;
+      position: relative;
+    }
+    .exp:hover {
+      border-color: var(--fg-dim);
+    }
+    .exp[aria-expanded="true"] {
+      grid-column: 1 / -1;
+      cursor: default;
+    }
+    .exp-chevron {
+      color: var(--fg-faint);
+      font-size: 12px;
+      margin-left: 8px;
+      transition: transform 0.2s ease;
+      display: inline-block;
+    }
+    .exp[aria-expanded="true"] .exp-chevron {
+      transform: rotate(90deg);
+    }
+
+    /* Policy code section, only shown when expanded */
+    .exp-policy {
+      margin-top: 6px;
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+    }
+    .exp-policy .policy-head {
+      display: flex; align-items: baseline; justify-content: space-between;
+      gap: 10px; flex-wrap: wrap;
+      font-size: 11px;
+      color: var(--fg-faint);
+      text-transform: uppercase; letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+    .exp-policy pre {
+      margin: 0;
+      padding: 14px 16px;
+      background: var(--bg-elev-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono",
+                   "Roboto Mono", Menlo, Consolas, monospace;
+      font-size: 12.5px;
+      line-height: 1.55;
+      overflow-x: auto;
+      color: var(--fg);
+      white-space: pre;
+    }
+    .exp-policy .policy-empty {
+      padding: 14px;
+      font-size: 13px;
+      color: var(--fg-faint);
+      font-style: italic;
+      background: var(--bg-elev-2);
+      border: 1px dashed var(--border);
+      border-radius: 6px;
     }
     .exp-head {
       display: flex; align-items: baseline; justify-content: space-between;
@@ -202,6 +260,11 @@
       text-transform: uppercase; letter-spacing: 0.05em;
     }
     .exp-row .val { color: var(--fg); font-weight: 500; }
+    .exp-row .val.score {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
     .exp-row .val.delta-pos { color: var(--accent); }
     .exp-row .val.delta-neg { color: var(--warn); }
     .progress {
@@ -597,19 +660,109 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       });
 
       root.innerHTML = rows.map(renderExperimentCard).join('');
+
+      // Re-apply expansion state across re-renders so the 15-second
+      // grid refresh doesn't yank the policy panel away mid-read.
+      expandedEnvs.forEach(env => {
+        const card = root.querySelector('.exp[data-env="' + cssEscape(env) + '"]');
+        if (!card) {
+          expandedEnvs.delete(env);
+          return;
+        }
+        card.setAttribute('aria-expanded', 'true');
+        const slot = card.querySelector('.exp-policy');
+        slot.hidden = false;
+        fetchPolicyInto(slot, env, /*useCache=*/true);
+        setTimeout(() => fetchPolicyInto(slot, env, false), 50);
+      });
+    }
+
+    function cssEscape(s) {
+      // Older Safari lacks CSS.escape; this fallback handles the
+      // env_name space (alphanumerics + underscores + hyphens).
+      if (window.CSS && CSS.escape) return CSS.escape(s);
+      return String(s).replace(/[^a-zA-Z0-9_\-]/g, '\\$&');
     }
 
     function renderExperimentCard(r) {
       const isLive = !!r.active;
       const stateLabel = isLive ? 'live' : 'idle';
 
+      // ── primary score line ─────────────────────────────────
+      // Order of preference:
+      //   1. In-flight batch's running best (`active.current_best_reward`)
+      //      — live, updating as chunks complete.
+      //   2. All-time best across completed batches (`best_reward`).
+      //   3. "awaiting first chunk" placeholder.
+      // If a baseline is known, show the delta inline so visitors
+      // can see at a glance whether the swarm is improving on the
+      // current best-known policy or just churning.
+      let scoreRow = '';
+      if (isLive && r.active.current_best_reward !== null &&
+                    r.active.current_best_reward !== undefined) {
+        const base = r.active.baseline_reward;
+        const delta =
+          (base !== null && base !== undefined)
+            ? r.active.current_best_reward - base
+            : null;
+        const deltaSpan = fmtDeltaSpan(delta, 'vs baseline');
+        scoreRow =
+          '<div class="exp-row">' +
+            '<span class="label">current best</span>' +
+            '<span class="val score">' + fmtScore(r.active.current_best_reward) + '</span>' +
+            deltaSpan +
+          '</div>';
+      } else if (r.best_reward !== null && r.best_reward !== undefined) {
+        scoreRow =
+          '<div class="exp-row">' +
+            '<span class="label">best so far</span>' +
+            '<span class="val score">' + fmtScore(r.best_reward) + '</span>' +
+          '</div>';
+      } else {
+        scoreRow =
+          '<div class="exp-row">' +
+            '<span class="label">score</span>' +
+            '<span class="val" style="color:var(--fg-faint)">awaiting first chunk</span>' +
+          '</div>';
+      }
+
+      // ── historical best (only shown when distinct from current) ──
+      let historicalLine = '';
+      if (isLive &&
+          r.best_reward !== null && r.best_reward !== undefined) {
+        historicalLine =
+          '<div class="exp-row">' +
+            '<span class="label">all-time</span>' +
+            '<span class="val">' + fmtScore(r.best_reward) + '</span>' +
+          '</div>';
+      }
+
+      // ── latest completed batch line ────────────────────────
+      let latestLine = '';
+      if (r.latest) {
+        const tb = r.latest.target_bit;
+        const deltaSpan = fmtDeltaSpan(r.latest.delta, 'vs baseline');
+        latestLine =
+          '<div class="exp-row">' +
+            '<span class="label">latest</span>' +
+            '<span class="val">' + fmtScore(r.latest.best_reward) + '</span>' +
+            deltaSpan +
+            (tb !== null && tb !== undefined
+              ? '<span class="label" style="margin-left:8px">bit</span>' +
+                '<span class="val">' + escapeHtml(String(tb)) + '</span>'
+              : '') +
+          '</div>';
+      }
+
+      // ── progress (only when live) ──────────────────────────
       let progressBar = '';
       let progressLine = '';
       if (isLive) {
         const pct = Math.max(0, Math.min(1, r.active.progress || 0)) * 100;
         const tb = r.active.target_bit;
         progressBar =
-          '<div class="progress" aria-label="batch progress">' +
+          '<div class="progress" aria-label="batch progress" title="' +
+            pct.toFixed(1) + '% complete">' +
             '<span style="width:' + pct.toFixed(1) + '%"></span>' +
           '</div>';
         progressLine =
@@ -617,6 +770,7 @@ mix run experiments/humanoid/round-1.exs</code></pre>
             '<span class="label">batch</span>' +
             '<span class="val">' + fmt(r.active.completed_chunks) + ' / ' +
               fmt(r.active.total_chunks) + ' chunks</span>' +
+            '<span class="val" style="color:var(--fg-dim)">(' + pct.toFixed(1) + '%)</span>' +
             (tb !== null && tb !== undefined
               ? '<span class="label" style="margin-left:8px">bit</span>' +
                 '<span class="val">' + escapeHtml(String(tb)) + '</span>'
@@ -626,52 +780,163 @@ mix run experiments/humanoid/round-1.exs</code></pre>
           '</div>';
       }
 
-      const achieved =
-        r.best_reward !== null && r.best_reward !== undefined
-          ? '<span class="val">' + fmtScore(r.best_reward) + '</span>'
-          : '<span class="val" style="color:var(--fg-faint)">awaiting first batch</span>';
-
-      let latestLine = '';
-      if (r.latest) {
-        const d = fmtDelta(r.latest.delta);
-        const cls = r.latest.delta > 0 ? 'val delta-pos'
-                  : r.latest.delta < 0 ? 'val delta-neg' : 'val';
-        const tb = r.latest.target_bit;
-        latestLine =
-          '<div class="exp-row">' +
-            '<span class="label">latest</span>' +
-            '<span class="val">' + fmtScore(r.latest.best_reward) + '</span>' +
-            (d !== null
-              ? '<span class="' + cls + '">' + escapeHtml(d) + ' vs baseline</span>'
-              : '') +
-            (tb !== null && tb !== undefined
-              ? '<span class="label" style="margin-left:8px">bit</span>' +
-                '<span class="val">' + escapeHtml(String(tb)) + '</span>'
-              : '') +
-          '</div>';
-      }
-
       const completed =
         '<div class="exp-row">' +
           '<span class="label">batches</span>' +
           '<span class="val">' + fmt(r.completed_batches) + ' completed</span>' +
         '</div>';
 
+      const env = r.env_name;
       return (
-        '<div class="exp">' +
+        '<div class="exp" data-env="' + escapeHtml(env) + '" ' +
+             'aria-expanded="false" role="button" tabindex="0" ' +
+             'onclick="toggleExp(this, event)" ' +
+             'onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();toggleExp(this,event)}">' +
           '<div class="exp-head">' +
-            '<div class="exp-env">' + escapeHtml(r.env_name) + '</div>' +
+            '<div class="exp-env">' +
+              escapeHtml(env) +
+              '<span class="exp-chevron" aria-hidden="true">\u203A</span>' +
+            '</div>' +
             '<div class="exp-state ' + stateLabel + '">' + stateLabel + '</div>' +
           '</div>' +
-          '<div class="exp-row">' +
-            '<span class="label">achieved</span>' + achieved +
-          '</div>' +
+          scoreRow +
+          historicalLine +
           latestLine +
           progressLine +
           progressBar +
           completed +
+          // Lazily filled by toggleExp() on first expansion
+          '<div class="exp-policy" hidden></div>' +
         '</div>'
       );
+    }
+
+    function fmtDeltaSpan(delta, label) {
+      if (delta === null || delta === undefined || Number.isNaN(delta)) {
+        return '';
+      }
+      const v = Number(delta);
+      const cls = v > 0 ? 'val delta-pos'
+                : v < 0 ? 'val delta-neg' : 'val';
+      const text = fmtDelta(v) + (label ? ' ' + label : '');
+      return '<span class="' + cls + '" style="margin-left:8px">' + escapeHtml(text) + '</span>';
+    }
+
+    // ── click-to-expand: lazy policy fetch ─────────────────
+    // Collapsed state keeps the card uncluttered with just score
+    // + progress; expanded state reveals the current synthesized
+    // policy as Python pseudocode. We cache snapshots in memory
+    // and track which env cards are expanded so the 15-second
+    // grid refresh doesn't collapse the policy panel from under
+    // a reader's nose.
+    const policyCache = {};
+    let expandedEnvs = new Set();
+
+    function fetchPolicyInto(slot, env, useCache) {
+      if (useCache && policyCache[env]) {
+        slot.dataset.loaded = '1';
+        slot.innerHTML = renderPolicyBlock(policyCache[env], env);
+        return;
+      }
+      slot.innerHTML =
+        '<div class="policy-head"><span>current policy</span><span>loading…</span></div>' +
+        '<div class="policy-empty">fetching latest snapshot…</div>';
+
+      fetch('/api/public-status/policies/' + encodeURIComponent(env))
+        .then(r => {
+          if (r.status === 404) return { _missing: true };
+          if (!r.ok) return Promise.reject('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(s => {
+          policyCache[env] = s;
+          slot.dataset.loaded = '1';
+          slot.innerHTML = renderPolicyBlock(s, env);
+        })
+        .catch(reason => {
+          slot.dataset.loaded = '1';
+          slot.innerHTML =
+            '<div class="policy-head"><span>current policy</span></div>' +
+            '<div class="policy-empty">unavailable (' + escapeHtml(String(reason)) + ')</div>';
+        });
+    }
+
+    function toggleExp(card, event) {
+      // Don't toggle when the click landed on a link inside the card.
+      if (event && event.target && event.target.closest('a')) return;
+
+      const env = card.getAttribute('data-env');
+      const expanded = card.getAttribute('aria-expanded') === 'true';
+      if (expanded) {
+        card.setAttribute('aria-expanded', 'false');
+        expandedEnvs.delete(env);
+        return;
+      }
+
+      card.setAttribute('aria-expanded', 'true');
+      expandedEnvs.add(env);
+      const slot = card.querySelector('.exp-policy');
+      slot.hidden = false;
+
+      // Use cache for instant feedback, but always queue a fresh
+      // fetch so a user staring at an expanded card sees their
+      // master's freshest accepted bit land within a few seconds.
+      fetchPolicyInto(slot, env, /*useCache=*/true);
+      setTimeout(() => fetchPolicyInto(slot, env, false), 50);
+    }
+
+    function renderPolicyBlock(s, env) {
+      if (!s || s._missing || !s.policy_code) {
+        return (
+          '<div class="policy-head">' +
+            '<span>current policy</span>' +
+            '<span>no snapshot yet</span>' +
+          '</div>' +
+          '<div class="policy-empty">' +
+            'no policy snapshot published for <strong>' + escapeHtml(env) + '</strong> yet. ' +
+            'The master will push one on the first accepted CEGAR bit.' +
+          '</div>'
+        );
+      }
+
+      const headBits = [];
+      if (s.target_bit !== null && s.target_bit !== undefined && s.n_bits) {
+        headBits.push('bit ' + escapeHtml(String(s.target_bit)) + ' / ' + escapeHtml(String(s.n_bits)));
+      }
+      if (s.cegar_iter !== null && s.cegar_iter !== undefined) {
+        headBits.push('CEGAR round ' + escapeHtml(String(s.cegar_iter)));
+      }
+      if (s.iter !== null && s.iter !== undefined) {
+        headBits.push('iter ' + escapeHtml(String(s.iter)));
+      }
+      if (s.best_reward !== null && s.best_reward !== undefined) {
+        headBits.push('r = ' + fmtScore(s.best_reward));
+      }
+      if (s.updated_at) {
+        headBits.push('updated ' + fmtUpdatedAt(s.updated_at));
+      }
+
+      const lang = s.code_language || 'python';
+      return (
+        '<div class="policy-head">' +
+          '<span>current policy (' + escapeHtml(lang) + ')</span>' +
+          '<span>' + headBits.map(escapeHtml).join(' · ') + '</span>' +
+        '</div>' +
+        '<pre><code>' + escapeHtml(s.policy_code) + '</code></pre>'
+      );
+    }
+
+    function fmtUpdatedAt(iso) {
+      try {
+        const d = new Date(iso);
+        const diffSecs = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+        if (diffSecs < 60)   return diffSecs + 's ago';
+        if (diffSecs < 3600) return Math.floor(diffSecs / 60) + 'm ago';
+        if (diffSecs < 86400) return (diffSecs / 3600).toFixed(1) + 'h ago';
+        return (diffSecs / 86400).toFixed(1) + 'd ago';
+      } catch (_e) {
+        return iso;
+      }
     }
 
     function refreshExperiments() {

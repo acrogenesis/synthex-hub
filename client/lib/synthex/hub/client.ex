@@ -298,6 +298,33 @@ defmodule Synthex.Hub.Client do
     end
   end
 
+  @doc """
+  Push the master's latest policy state to the hub. Master-auth
+  endpoint; upserts on `env_name`.
+
+  `attrs` MUST include `env_name`. Recommended other fields:
+  `bit_predicates` (JSON-safe form via
+  `Synthex.Core.PrettyPrint.to_json_term/1`), `policy_code`,
+  `n_bits`, `target_bit`, `cegar_iter`, `iter`, `best_reward`,
+  `baseline_reward`, `batch_id`.
+
+  Returns `{:ok, snapshot}` on success, `{:error, reason}` on
+  HTTP / transport failure. Intentionally a "fire and check"
+  call — masters should NOT crash on a snapshot push failure.
+  """
+  def push_policy_snapshot(%__MODULE__{} = client, attrs) when is_map(attrs) do
+    case Req.post(url(client, "/master/policy-snapshots"),
+           headers: auth_headers(client),
+           json: attrs,
+           receive_timeout: client.request_timeout_ms,
+           retry: false
+         ) do
+      {:ok, %{status: 200, body: body}} -> {:ok, body}
+      {:ok, %{status: s, body: b}} -> {:error, "HTTP #{s}: #{inspect(b)}"}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp url(%__MODULE__{base_url: base}, path) do
     String.trim_trailing(base, "/") <> path
   end

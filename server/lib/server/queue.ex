@@ -32,7 +32,7 @@ defmodule Server.Queue do
   """
 
   import Ecto.Query
-  alias Server.{Batch, BatchContribution, Repo, BrokerWorker, WorkerNode}
+  alias Server.{Batch, BatchContribution, PolicySnapshot, Repo, BrokerWorker, WorkerNode}
 
   @default_chunk_size 100
 
@@ -750,5 +750,62 @@ defmodule Server.Queue do
 
   defp default_chunk_size do
     Application.get_env(:server, :default_chunk_size, @default_chunk_size)
+  end
+
+  # ── Policy snapshots ────────────────────────────────────────
+
+  @doc """
+  Upsert the latest policy snapshot for an environment. Called by
+  masters via `POST /api/master/policy-snapshots` whenever the
+  CEGAR loop accepts a new bit.
+  """
+  def upsert_policy_snapshot(attrs, opts \\ []) do
+    submitter = Keyword.get(opts, :submitter)
+
+    attrs =
+      attrs
+      |> Map.put_new("submitter", submitter)
+      |> stringify_top_level_keys()
+
+    existing =
+      case Map.get(attrs, "env_name") do
+        nil -> %PolicySnapshot{}
+        env -> Repo.get(PolicySnapshot, env) || %PolicySnapshot{}
+      end
+
+    existing
+    |> PolicySnapshot.changeset(attrs)
+    |> Repo.insert_or_update()
+  end
+
+  @doc "Latest snapshot for an env, or `{:error, :not_found}`."
+  def get_policy_snapshot(env_name) do
+    case Repo.get(PolicySnapshot, env_name) do
+      nil -> {:error, :not_found}
+      snapshot -> {:ok, snapshot}
+    end
+  end
+
+  @doc """
+  All snapshots, newest-first. Used for a future "all current
+  policies" overview endpoint.
+  """
+  def list_policy_snapshots(limit \\ 50) do
+    from(s in PolicySnapshot,
+      order_by: [desc: s.updated_at],
+      limit: ^limit
+    )
+    |> Repo.all()
+  end
+
+  # Plug.Parsers decodes JSON keys as strings; PolicySnapshot.changeset
+  # uses `cast/3` which accepts string or atom keys, but we
+  # normalize defensively so atom-keyed callers (tests, scripts)
+  # work too.
+  defp stringify_top_level_keys(map) when is_map(map) do
+    Map.new(map, fn
+      {k, v} when is_atom(k) -> {Atom.to_string(k), v}
+      kv -> kv
+    end)
   end
 end

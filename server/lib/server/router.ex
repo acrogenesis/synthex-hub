@@ -55,8 +55,26 @@ defmodule Server.Router do
 
   get "/api/public-status" do
     conn
-    |> put_resp_header("cache-control", "public, max-age=15")
+    |> put_public_headers()
     |> send_json(200, Server.Queue.public_status())
+  end
+
+  # CORS preflight for browsers fetching public-status from any
+  # origin (showcase pages, embeds, etc.).
+  options "/api/public-status" do
+    send_cors_preflight(conn)
+  end
+
+  options "/api/public-status/experiments" do
+    send_cors_preflight(conn)
+  end
+
+  options "/api/public-status/leaderboard" do
+    send_cors_preflight(conn)
+  end
+
+  options "/api/public-status/batches/:_batch_id/contributors" do
+    send_cors_preflight(conn)
   end
 
   # Per-environment view of in-flight + recently-completed
@@ -65,7 +83,7 @@ defmodule Server.Router do
   # swarm has actually learned, not just job throughput.
   get "/api/public-status/experiments" do
     conn
-    |> put_resp_header("cache-control", "public, max-age=15")
+    |> put_public_headers()
     |> send_json(200, %{experiments: Server.Queue.experiments_summary()})
   end
 
@@ -76,7 +94,7 @@ defmodule Server.Router do
     limit = parse_limit(conn.params["limit"], default: 20, max: 100)
 
     conn
-    |> put_resp_header("cache-control", "public, max-age=15")
+    |> put_public_headers()
     |> send_json(200, %{contributors: Server.Queue.leaderboard(limit: limit)})
   end
 
@@ -86,11 +104,31 @@ defmodule Server.Router do
     limit = parse_limit(conn.params["limit"], default: 50, max: 500)
 
     conn
-    |> put_resp_header("cache-control", "public, max-age=15")
+    |> put_public_headers()
     |> send_json(200, %{
       batch_id: batch_id,
       contributors: Server.Queue.batch_contributors(batch_id, limit: limit)
     })
+  end
+
+  # Latest policy snapshot for an env. Public; CORS-enabled so
+  # the showcase / landing page can fetch from any origin.
+  get "/api/public-status/policies/:env_name" do
+    case Server.Queue.get_policy_snapshot(env_name) do
+      {:ok, snapshot} ->
+        conn
+        |> put_public_headers()
+        |> send_json(200, render_snapshot(snapshot))
+
+      {:error, :not_found} ->
+        conn
+        |> put_public_headers()
+        |> send_json(404, %{error: "snapshot_not_found", env_name: env_name})
+    end
+  end
+
+  options "/api/public-status/policies/:_env_name" do
+    send_cors_preflight(conn)
   end
 
   get "/api/status" do
@@ -174,6 +212,26 @@ defmodule Server.Router do
       send_full_batch(conn, batch_id)
     else
       send_batch_progress(conn, batch_id)
+    end
+  end
+
+  # Upsert the latest policy snapshot for an env. The master calls
+  # this from its telemetry handler on each accepted CEGAR step.
+  # One row per `env_name`; subsequent posts overwrite. Returns the
+  # canonical snapshot so the caller can confirm what's stored.
+  post "/api/master/policy-snapshots" do
+    payload = conn.body_params
+    submitter = List.first(get_req_header(conn, "x-submitter"))
+
+    case Server.Queue.upsert_policy_snapshot(payload, submitter: submitter) do
+      {:ok, snapshot} ->
+        send_json(conn, 200, render_snapshot(snapshot))
+
+      {:error, changeset} ->
+        send_json(conn, 422, %{
+          error: "invalid_snapshot",
+          details: format_errors(changeset)
+        })
     end
   end
 
@@ -290,6 +348,42 @@ defmodule Server.Router do
     conn
     |> put_resp_content_type("application/json")
     |> send_resp(status, Jason.encode!(body))
+  end
+
+  # Public read-only endpoints: allow cross-origin reads (showcase
+  # pages, embeds, hackathon dashboards) and cache briefly so the
+  # database isn't hammered by polling browsers.
+  defp put_public_headers(conn) do
+    conn
+    |> put_resp_header("cache-control", "public, max-age=15")
+    |> put_resp_header("access-control-allow-origin", "*")
+    |> put_resp_header("access-control-allow-methods", "GET, OPTIONS")
+  end
+
+  defp send_cors_preflight(conn) do
+    conn
+    |> put_resp_header("access-control-allow-origin", "*")
+    |> put_resp_header("access-control-allow-methods", "GET, OPTIONS")
+    |> put_resp_header("access-control-max-age", "86400")
+    |> send_resp(204, "")
+  end
+
+  defp render_snapshot(%Server.PolicySnapshot{} = s) do
+    %{
+      env_name: s.env_name,
+      policy_code: s.policy_code,
+      code_language: s.code_language,
+      bit_predicates: s.bit_predicates,
+      n_bits: s.n_bits,
+      target_bit: s.target_bit,
+      cegar_iter: s.cegar_iter,
+      iter: s.iter,
+      best_reward: s.best_reward,
+      baseline_reward: s.baseline_reward,
+      batch_id: s.batch_id,
+      submitter: s.submitter,
+      updated_at: s.updated_at
+    }
   end
 
   defp parse_limit(value, opts) do

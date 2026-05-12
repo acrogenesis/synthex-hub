@@ -3,6 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Resolve relative asset paths (videos/*.mp4, etc.) under
+         /showcase/ when served over HTTP(S). Plug.Router normalizes
+         trailing slashes, so /showcase and /showcase/ both serve this
+         file — without <base>, a browser landing on /showcase would
+         resolve `videos/x.mp4` against the site root and miss the
+         prefix. Skipped under file:// so local viewing still works. -->
+    <script>
+      if (location.protocol !== 'file:') {
+        document.write('<base href="/showcase/">');
+      }
+    </script>
     <title>CSHRL Policy Showcase</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />

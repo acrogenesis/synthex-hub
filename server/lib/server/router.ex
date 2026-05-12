@@ -37,14 +37,14 @@ defmodule Server.Router do
     serve_static(conn, "index.html", "text/html; charset=utf-8")
   end
 
-  # Showcase: hand-curated static page with policy videos.
-  # `/showcase` and `/showcase/` resolve to the index file; everything
-  # under `/showcase/*` is served verbatim by Plug.Static above.
+  # Showcase: hand-curated static page with policy videos. Both
+  # `/showcase` and `/showcase/` resolve to the index file (Plug.Router
+  # normalizes trailing slashes, so a single route covers both).
+  # Everything under `/showcase/*` is served verbatim by Plug.Static
+  # above. The HTML carries `<base href="/showcase/">` so relative
+  # asset paths (e.g. `videos/foo.mp4`) always resolve under
+  # /showcase/ regardless of which URL form the visitor lands on.
   get "/showcase" do
-    serve_static(conn, "showcase/index.html", "text/html; charset=utf-8")
-  end
-
-  get "/showcase/" do
     serve_static(conn, "showcase/index.html", "text/html; charset=utf-8")
   end
 

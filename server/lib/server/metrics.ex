@@ -20,8 +20,11 @@ defmodule Server.Metrics do
   import Ecto.Query
   alias Server.{Repo, Batch, WorkerNode}
 
-  @pending_states ~w(available scheduled retryable)
-  @executing_states ~w(executing)
+  # Oban's `state` column is an Ecto.Enum — queries must use atoms,
+  # not strings. Passing strings raises a vague %ArgumentError{} from
+  # deep inside Ecto's type cast and breaks the whole snapshot.
+  @pending_states [:available, :scheduled, :retryable]
+  @executing_states [:executing]
 
   @spec snapshot() :: map()
   def snapshot do

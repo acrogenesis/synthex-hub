@@ -65,7 +65,14 @@ defmodule Server.MetricsBroker do
         do_refresh(state)
       rescue
         err ->
-          Logger.warning("[MetricsBroker] refresh failed: #{inspect(err)}")
+          # Include stacktrace so vague %ArgumentError{}s (e.g. from
+          # Ecto type-cast mismatches deep in a query) are
+          # debuggable from production logs without redeploying.
+          Logger.warning(
+            "[MetricsBroker] refresh failed: #{Exception.message(err)}\n" <>
+              Exception.format_stacktrace(__STACKTRACE__)
+          )
+
           state
       end
 

@@ -33,6 +33,13 @@ defmodule Server.Batch do
     # to compute the `health` flag surfaced on the landing page.
     field :master_polled_at, :utc_datetime_usec
 
+    # FK to the experiment this batch belongs to. NULL for legacy
+    # batches submitted before the Oban-master refactor (and for
+    # any laptop-driven master that hasn't been upgraded to pass
+    # the field). Set, when present, lets OrphanReaper cancel
+    # chunks whose owning experiment has died.
+    field :experiment_id, Ecto.UUID
+
     timestamps(type: :utc_datetime_usec)
   end
 
@@ -53,7 +60,8 @@ defmodule Server.Batch do
       :ttl_at,
       :best_reward,
       :baseline_reward,
-      :master_polled_at
+      :master_polled_at,
+      :experiment_id
     ])
     |> validate_required([:id, :env_name, :cmd, :total_chunks])
     |> validate_inclusion(:status, ~w(pending running completed failed cancelled))

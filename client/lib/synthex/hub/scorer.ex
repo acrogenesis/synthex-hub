@@ -48,6 +48,10 @@ defmodule Synthex.Hub.Scorer do
 
     * `:env_key` — required. Tagged onto each batch for accounting;
       passed to the fallback if you provide one.
+    * `:experiment_id` — optional. When set, every batch this scorer
+      submits will carry the FK so the hub can link batches to
+      their owning experiment (used by `Server.Jobs.OrphanReaper`
+      to clean up orphan chunks when the master dies).
     * `:url`, `:token` — passed through to `Synthex.Hub.Client.new/1`.
     * `:chunk_size`, `:poll_interval_ms`, `:request_timeout_ms`,
       `:max_wait_ms` — all forwarded to `Synthex.Hub.Client`.
@@ -108,13 +112,15 @@ defmodule Synthex.Hub.Scorer do
       )
 
     state_stride = Keyword.get(opts, :state_stride, 10)
+    experiment_id = Keyword.get(opts, :experiment_id)
 
     state = %{
       score_client: client,
       collect_client: collect_client,
       fallback: fallback,
       batch_prefix: batch_prefix,
-      state_stride: state_stride
+      state_stride: state_stride,
+      experiment_id: experiment_id
     }
 
     fn request -> dispatch(request, state) end
@@ -122,10 +128,13 @@ defmodule Synthex.Hub.Scorer do
 
   defp dispatch(%{"cmd" => "score_bit"} = request, %{
          score_client: client,
-         batch_prefix: batch_prefix
+         batch_prefix: batch_prefix,
+         experiment_id: experiment_id
        }) do
     target_bit = request["target_bit"]
     batch_name = "#{batch_prefix}-bit#{target_bit}"
+
+    request = maybe_put_experiment_id(request, experiment_id)
 
     case Client.score_bit(client, request, batch_name: batch_name) do
       {:ok, %{scores: scores, baseline_reward: baseline}} ->
@@ -144,11 +153,15 @@ defmodule Synthex.Hub.Scorer do
   defp dispatch(%{"cmd" => "collect_states"} = request, %{
          collect_client: client,
          batch_prefix: batch_prefix,
-         state_stride: state_stride
+         state_stride: state_stride,
+         experiment_id: experiment_id
        }) do
     batch_name = "#{batch_prefix}-collect"
 
-    request = Map.put_new(request, "state_stride", state_stride)
+    request =
+      request
+      |> Map.put_new("state_stride", state_stride)
+      |> maybe_put_experiment_id(experiment_id)
 
     case Client.collect_states(client, request, batch_name: batch_name) do
       {:ok, %{states: states, n_landings: n_landings, n_episodes: n_episodes}} ->
@@ -166,5 +179,11 @@ defmodule Synthex.Hub.Scorer do
 
   defp dispatch(request, %{fallback: fallback}) do
     fallback.(request)
+  end
+
+  defp maybe_put_experiment_id(request, nil), do: request
+
+  defp maybe_put_experiment_id(request, id) when is_binary(id) do
+    Map.put(request, "experiment_id", id)
   end
 end

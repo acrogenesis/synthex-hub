@@ -62,7 +62,8 @@ defmodule Server.Queue do
           payload: scrub_payload(payload),
           total_chunks: total_chunks,
           status: if(total_chunks == 0, do: "completed", else: "pending"),
-          submitter: submitter
+          submitter: submitter,
+          experiment_id: extract_experiment_id(payload)
         })
         |> Repo.insert()
 
@@ -965,6 +966,18 @@ defmodule Server.Queue do
     payload
     |> Map.drop(["candidates"])
     |> Map.put("n_candidates", length(Map.get(payload, "candidates", [])))
+  end
+
+  # Pull `experiment_id` out of the master's submit payload so the
+  # `batches.experiment_id` FK is set on every batch the new
+  # Oban-master refactor spawns. Legacy (laptop-driven) masters
+  # don't include this key, in which case the FK stays NULL and
+  # the batch behaves exactly as before.
+  defp extract_experiment_id(payload) do
+    case Map.get(payload, "experiment_id") do
+      id when is_binary(id) and byte_size(id) > 0 -> id
+      _ -> nil
+    end
   end
 
   defp default_chunk_size do

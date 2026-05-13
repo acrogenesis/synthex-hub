@@ -37,8 +37,30 @@ defmodule Server.MixProject do
       {:jason, "~> 1.4"},
       {:ecto_sql, "~> 3.12"},
       {:postgrex, "~> 0.19"},
-      {:oban, "~> 2.18"}
+      {:oban, "~> 2.18"},
+      # The CEGAR synthesis primitives (`Synthex.Gym.Mujoco.optimize_bit/5`
+      # etc.) live in the synthex repo. Server.Workers.* drives them
+      # from inside Oban jobs, so the entire master loop is a
+      # supervised, checkpointable process on the hub rather than a
+      # one-shot script on someone's laptop. `synthex_hub_client`
+      # carries the HTTP client and the `Synthex.Hub.Scorer` adapter;
+      # we configure it to talk to localhost so we reuse all the
+      # existing batch/chunk machinery without going through the
+      # public proxy.
+      synthex_dep(),
+      {:synthex_hub_client, path: "../client"}
     ]
+  end
+
+  defp synthex_dep do
+    case System.get_env("SYNTHEX_PATH") do
+      path when is_binary(path) and path != "" ->
+        {:synthex, path: path, override: true}
+
+      _ ->
+        ref = System.get_env("SYNTHEX_GIT_REF", "main")
+        {:synthex, git: "https://github.com/doctorcorral/synthex.git", ref: ref, override: true}
+    end
   end
 
   defp aliases do

@@ -37,7 +37,23 @@ defmodule Synthex.Hub.Client do
   # wrapper) with plenty of margin for nested predicate ADTs.
   @default_max_candidates_per_submit 50_000
 
-  @default_max_wait_ms 24 * 60 * 60 * 1000
+  # `await_batch/2` gives up only when chunks STOP arriving — workers
+  # contribute continuously, even slowly, so a strict wall-clock cap
+  # is the wrong signal. The relevant question is "did the worker
+  # swarm stall?", not "has it been a long time?".
+  #
+  #   * `stall_timeout_ms` — primary control. If `completed_chunks`
+  #     hasn't increased for this long, raise. Default: 2 hours,
+  #     which is plenty even for slow envs where a single worker
+  #     takes ~20 min per Humanoid chunk; small swarms still produce
+  #     at least one completion in that window when alive.
+  #
+  #   * `max_wait_ms` — absolute upper bound, retained only as a
+  #     safety net so a runaway master can't poll forever. Default
+  #     30 days = "effectively unlimited" for the kinds of runs we
+  #     do here. Users with strict budgets can override per-client.
+  @default_stall_timeout_ms 2 * 60 * 60 * 1000
+  @default_max_wait_ms 30 * 24 * 60 * 60 * 1000
 
   @type t :: %__MODULE__{
           base_url: String.t(),
@@ -45,6 +61,7 @@ defmodule Synthex.Hub.Client do
           chunk_size: pos_integer(),
           poll_interval_ms: pos_integer(),
           request_timeout_ms: pos_integer(),
+          stall_timeout_ms: pos_integer(),
           max_wait_ms: pos_integer()
         }
 
@@ -53,6 +70,7 @@ defmodule Synthex.Hub.Client do
             chunk_size: @default_chunk_size,
             poll_interval_ms: @default_poll_interval_ms,
             request_timeout_ms: @default_request_timeout_ms,
+            stall_timeout_ms: @default_stall_timeout_ms,
             max_wait_ms: @default_max_wait_ms
 
   @doc """
@@ -67,6 +85,7 @@ defmodule Synthex.Hub.Client do
       chunk_size: Keyword.get(opts, :chunk_size, @default_chunk_size),
       poll_interval_ms: Keyword.get(opts, :poll_interval_ms, @default_poll_interval_ms),
       request_timeout_ms: Keyword.get(opts, :request_timeout_ms, @default_request_timeout_ms),
+      stall_timeout_ms: Keyword.get(opts, :stall_timeout_ms, @default_stall_timeout_ms),
       max_wait_ms: Keyword.get(opts, :max_wait_ms, @default_max_wait_ms)
     }
   end
@@ -302,47 +321,95 @@ defmodule Synthex.Hub.Client do
   to actually fetch the chunk results.
   """
   def await_batch(%__MODULE__{} = client, batch_id) do
-    deadline = System.monotonic_time(:millisecond) + client.max_wait_ms
-    poll_loop(client, batch_id, deadline, _last_progress = -1)
+    now = System.monotonic_time(:millisecond)
+
+    state = %{
+      hard_deadline: now + client.max_wait_ms,
+      # Initialize the stall clock at "now" — the very first poll
+      # provides the baseline `last_completed`. If the batch never
+      # gets any chunks done within stall_timeout_ms, we bail.
+      last_progress_at: now,
+      last_completed: -1,
+      last_logged_progress: -1.0
+    }
+
+    poll_loop(client, batch_id, state)
   end
 
-  defp poll_loop(client, batch_id, deadline, last_progress) do
-    if System.monotonic_time(:millisecond) > deadline do
-      {:error, "max_wait_ms exceeded for batch #{batch_id}"}
-    else
-      case fetch_batch(client, batch_id, include_results: false) do
-        {:ok, %{"status" => "completed"}} ->
-          # One heavy fetch, only once: pull the full results.
-          case fetch_batch(client, batch_id, include_results: true) do
-            {:ok, %{"results" => results}} -> {:ok, results || []}
-            {:ok, _} -> {:ok, []}
-            {:error, reason} -> {:error, "completed but failed to fetch results: #{reason}"}
+  # Progress-driven polling:
+  #
+  #   * Reset the stall clock whenever `completed_chunks` grows.
+  #   * Stall check happens AFTER each successful fetch — so a master
+  #     that goes offline (laptop sleep, etc.) and resumes much
+  #     later won't trip the timer as long as the next fetch shows
+  #     chunks have been completed by workers in the meantime.
+  #   * Transient HTTP errors don't reset the stall clock, but they
+  #     don't advance it either (we just sleep and retry).
+  defp poll_loop(client, batch_id, st) do
+    now = System.monotonic_time(:millisecond)
+
+    case fetch_batch(client, batch_id, include_results: false) do
+      {:ok, %{"status" => "completed"}} ->
+        # Heavy fetch, exactly once at the end.
+        case fetch_batch(client, batch_id, include_results: true) do
+          {:ok, %{"results" => results}} -> {:ok, results || []}
+          {:ok, _} -> {:ok, []}
+          {:error, reason} -> {:error, "completed but failed to fetch results: #{reason}"}
+        end
+
+      {:ok, %{"status" => "failed"} = body} ->
+        {:error, "batch #{batch_id} failed: #{inspect(body)}"}
+
+      {:ok, %{} = body} ->
+        completed = body["completed_chunks"] || 0
+        total = body["total_chunks"] || 0
+        progress = body["progress"] || 0.0
+
+        st =
+          if completed > st.last_completed do
+            %{st | last_completed: completed, last_progress_at: now}
+          else
+            st
           end
 
-        {:ok, %{"status" => "failed"} = body} ->
-          {:error, "batch #{batch_id} failed: #{inspect(body)}"}
-
-        {:ok, %{} = body} ->
-          progress = body["progress"] || 0.0
-          completed = body["completed_chunks"] || 0
-          total = body["total_chunks"] || 0
-
-          if progress != last_progress do
+        st =
+          if progress != st.last_logged_progress do
             Logger.info(
               "[Hub] batch #{batch_id}: #{Float.round((progress || 0.0) * 100, 1)}%  (#{completed}/#{total} chunks)"
             )
+
+            %{st | last_logged_progress: progress}
+          else
+            st
           end
 
-          Process.sleep(client.poll_interval_ms)
-          poll_loop(client, batch_id, deadline, progress)
+        cond do
+          now - st.last_progress_at > client.stall_timeout_ms ->
+            mins = div(client.stall_timeout_ms, 60_000)
 
-        {:error, reason} ->
-          # Transient HTTP errors shouldn't kill a multi-hour run;
-          # log and retry until the deadline.
-          Logger.warning("[Hub] poll error: #{inspect(reason)} (will retry)")
+            {:error,
+             "batch #{batch_id} stalled: no new chunks completed in #{mins} minutes " <>
+               "(stuck at #{completed}/#{total}). Worker swarm offline?"}
+
+          now > st.hard_deadline ->
+            {:error, "absolute max_wait_ms exceeded for batch #{batch_id}"}
+
+          true ->
+            Process.sleep(client.poll_interval_ms)
+            poll_loop(client, batch_id, st)
+        end
+
+      {:error, reason} ->
+        # Transient HTTP errors shouldn't kill a multi-hour run;
+        # log and retry. Hard deadline still applies as a backstop.
+        Logger.warning("[Hub] poll error: #{inspect(reason)} (will retry)")
+
+        if now > st.hard_deadline do
+          {:error, "absolute max_wait_ms exceeded for batch #{batch_id}"}
+        else
           Process.sleep(client.poll_interval_ms)
-          poll_loop(client, batch_id, deadline, last_progress)
-      end
+          poll_loop(client, batch_id, st)
+        end
     end
   end
 

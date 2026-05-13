@@ -337,6 +337,43 @@
       margin-top: -2px;
       font-style: italic;
     }
+    /* Incidents banner — surfaced when system_events.level in
+       (warn, error) exist in the last 24h. Hidden by default; the
+       JS toggles `.show` when the API returns rows. */
+    .incidents {
+      margin: 24px 0;
+      border-radius: 10px;
+      border: 1px solid var(--warn);
+      background: rgba(255, 184, 108, 0.08);
+      padding: 12px 14px;
+      display: none;
+    }
+    .incidents.show { display: block; }
+    .incidents.error { border-color: #ff6b6b; background: rgba(255,107,107,0.08); }
+    .incidents-head {
+      display: flex; justify-content: space-between; align-items: center;
+      font-weight: 600; font-size: 13px;
+      color: var(--warn);
+    }
+    .incidents.error .incidents-head { color: #ff8a8a; }
+    .incidents-toggle {
+      font-size: 11px; color: var(--fg-dim); cursor: pointer;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .incidents-list {
+      margin: 10px 0 0; padding: 0; list-style: none;
+      font-size: 12px; color: var(--fg-dim);
+      max-height: 0; overflow: hidden;
+      transition: max-height 0.2s ease;
+    }
+    .incidents.expanded .incidents-list { max-height: 400px; overflow-y: auto; }
+    .incidents-list li {
+      padding: 6px 0;
+      border-top: 1px solid rgba(255,255,255,0.05);
+    }
+    .incidents-list li:first-child { border-top: none; }
+    .incidents-list .inc-msg { color: var(--fg); }
+    .incidents-list .inc-meta { color: var(--fg-faint); font-size: 11px; }
     .exp-row {
       display: flex; align-items: center; gap: 10px;
       font-size: 13px; color: var(--fg-dim);
@@ -523,6 +560,16 @@
       <div class="ll-tile"><span class="ll-label">total evals</span><span class="ll-val" data-k="evals_total">·</span></div>
       <div class="ll-tile"><span class="ll-label">cpu</span><span class="ll-val" data-k="cpu_pct">·</span></div>
       <span class="ll-pulse disconnected" id="ll-pulse" title="connecting…"></span>
+    </div>
+
+    <!-- Incidents banner. Populated by refreshIncidents() from
+         /api/public-status/incidents. Hidden when empty. -->
+    <div class="incidents" id="incidents" aria-live="polite">
+      <div class="incidents-head">
+        <span id="incidents-summary">no recent incidents</span>
+        <span class="incidents-toggle" onclick="toggleIncidents()">show details</span>
+      </div>
+      <ul class="incidents-list" id="incidents-list"></ul>
     </div>
 
     <div class="exps" id="experiments">
@@ -793,41 +840,39 @@ mix run experiments/humanoid/round-1.exs</code></pre>
 
     function renderExperimentCard(r) {
       const isLive = !!r.active;
-      // Health comes from the server's experiments_summary endpoint
-      // (driven by `master_polled_at` on each batch). Possible values:
-      //   "healthy"     — master polled recently
-      //   "stalled"     — master polled at least once but has gone silent
-      //   "no_poll_yet" — master never polled and batch is old enough
-      //                   that we'd expect a poll (master crashed
-      //                   before its first poll)
+      // Health from /api/public-status/experiments (now backed by
+      // the experiments table — every checkpointed bit refreshes
+      // the row's updated_at timestamp, which is the heartbeat).
+      // Possible values:
+      //   "healthy"      — Oban master active, checkpointing
+      //   "stalled"      — no checkpoint for > 5 min
+      //   "no_progress"  — pending without bootstrap progress
+      //   "unknown"      — anything else (e.g. completed)
       const health = isLive ? r.active.health : null;
-      const isStalled = health === 'stalled' || health === 'no_poll_yet';
+      const isStalled = health === 'stalled' || health === 'no_progress';
       const stateLabel =
         isStalled ? 'stalled' :
         isLive    ? 'live'    : 'idle';
 
       // ── primary score line ─────────────────────────────────
       // Order of preference:
-      //   1. In-flight batch's running best (`active.current_best_reward`)
-      //      — live, updating as chunks complete.
-      //   2. All-time best across completed batches (`best_reward`).
-      //   3. "awaiting first chunk" placeholder.
-      // If a baseline is known, show the delta inline so visitors
-      // can see at a glance whether the swarm is improving on the
-      // current best-known policy or just churning.
+      //   1. Active experiment's running best (`active.best_reward`)
+      //      — live, updates after every accepted bit.
+      //   2. All-time best across completed runs (`best_reward`).
+      //   3. "awaiting first bit" placeholder.
       let scoreRow = '';
-      if (isLive && r.active.current_best_reward !== null &&
-                    r.active.current_best_reward !== undefined) {
+      if (isLive && r.active.best_reward !== null &&
+                    r.active.best_reward !== undefined) {
         const base = r.active.baseline_reward;
         const delta =
           (base !== null && base !== undefined)
-            ? r.active.current_best_reward - base
+            ? r.active.best_reward - base
             : null;
         const deltaSpan = fmtDeltaSpan(delta, 'vs baseline');
         scoreRow =
           '<div class="exp-row">' +
             '<span class="label">current best</span>' +
-            '<span class="val score">' + fmtScore(r.active.current_best_reward) + '</span>' +
+            '<span class="val score">' + fmtScore(r.active.best_reward) + '</span>' +
             deltaSpan +
           '</div>';
       } else if (r.best_reward !== null && r.best_reward !== undefined) {
@@ -840,7 +885,7 @@ mix run experiments/humanoid/round-1.exs</code></pre>
         scoreRow =
           '<div class="exp-row">' +
             '<span class="label">score</span>' +
-            '<span class="val" style="color:var(--fg-faint)">awaiting first chunk</span>' +
+            '<span class="val" style="color:var(--fg-faint)">awaiting first bit</span>' +
           '</div>';
       }
 
@@ -855,19 +900,18 @@ mix run experiments/humanoid/round-1.exs</code></pre>
           '</div>';
       }
 
-      // ── latest completed batch line ────────────────────────
+      // ── latest completed run line ──────────────────────────
       let latestLine = '';
       if (r.latest) {
-        const tb = r.latest.target_bit;
         const deltaSpan = fmtDeltaSpan(r.latest.delta, 'vs baseline');
         latestLine =
           '<div class="exp-row">' +
             '<span class="label">latest</span>' +
             '<span class="val">' + fmtScore(r.latest.best_reward) + '</span>' +
             deltaSpan +
-            (tb !== null && tb !== undefined
-              ? '<span class="label" style="margin-left:8px">bit</span>' +
-                '<span class="val">' + escapeHtml(String(tb)) + '</span>'
+            (r.latest.accepted_count !== null && r.latest.accepted_count !== undefined
+              ? '<span class="label" style="margin-left:8px">bits</span>' +
+                '<span class="val">' + escapeHtml(String(r.latest.accepted_count)) + '</span>'
               : '') +
           '</div>';
       }
@@ -877,71 +921,63 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       let progressLine = '';
       if (isLive) {
         const pct = Math.max(0, Math.min(1, r.active.progress || 0)) * 100;
-        const tb = r.active.target_bit;
         progressBar =
-          '<div class="progress" aria-label="batch progress" title="' +
+          '<div class="progress" aria-label="CEGAR progress" title="' +
             pct.toFixed(1) + '% complete">' +
             '<span style="width:' + pct.toFixed(1) + '%"></span>' +
           '</div>';
-        // When score_bit candidates exceed the per-submit cap, the
-        // client splits into N parts (sub-batches over HTTP) and
-        // the server aggregates them back into one logical batch.
-        // Show the part count so visitors understand why "chunks
-        // total" can be in the tens of thousands.
-        const subCount = r.active.subbatch_count;
-        const partsFrag =
-          (subCount && subCount > 1)
-            ? '<span class="val" style="color:var(--fg-dim);margin-left:6px">' +
-                'across ' + fmt(subCount) + ' parts</span>'
-            : '';
 
-        // What's the master doing right now? Surfacing the command
-        // and (for score_bit) which bit it's searching makes the
-        // "completed: 0" counter below it self-explanatory: it
-        // counts how many such steps have finished, not chunks.
-        const cmd = r.active.cmd || 'unknown';
-        const stepLabel =
-          cmd === 'score_bit'
-            ? 'scoring bit ' + (tb !== null && tb !== undefined ? tb : '?')
-            : cmd === 'collect_states'
-              ? 'collecting states'
-              : cmd;
+        // CEGAR coordinates: which outer round and inner iteration
+        // the master is currently in, plus per-iter bit progress.
+        const cegarLabel =
+          'CEGAR ' + (r.active.cegar_iter || 0) + '/' + (r.active.total_cegar_iters || '?') +
+          '  iter ' + (r.active.iter || 0) + '/' + (r.active.total_iters || '?');
+
+        const bitsTotal = r.active.n_bits;
+        const bitsDone  = r.active.bits_done || 0;
+        const bitsFrag  =
+          (bitsTotal !== null && bitsTotal !== undefined)
+            ? '<span class="val">' + fmt(bitsDone) + ' / ' + fmt(bitsTotal) + ' bits</span>'
+            : '<span class="val">' + fmt(bitsDone) + ' bits</span>';
 
         progressLine =
           '<div class="exp-row">' +
             '<span class="label">step</span>' +
-            '<span class="val">' + escapeHtml(stepLabel) + '</span>' +
+            '<span class="val">' + escapeHtml(cegarLabel) + '</span>' +
             '<span class="label" style="margin-left:8px">elapsed</span>' +
             '<span class="val">' + fmtElapsed(r.active.elapsed_seconds) + '</span>' +
           '</div>' +
           '<div class="exp-row">' +
             '<span class="label">progress</span>' +
-            '<span class="val">' + fmt(r.active.completed_chunks) + ' / ' +
-              fmt(r.active.total_chunks) + ' chunks</span>' +
+            bitsFrag +
             '<span class="val" style="color:var(--fg-dim)">(' + pct.toFixed(1) + '%)</span>' +
-            partsFrag +
           '</div>';
       }
 
-      // Historical counter — score_bit completions only (those are
-      // the "bits accepted" CEGAR milestones; collect_states batches
-      // are infrastructure plumbing and excluded by the server).
+      // Accepted-bit history counter, plus total run count.
+      const acceptedFrag =
+        (isLive && r.active.accepted_count !== null && r.active.accepted_count !== undefined)
+          ? r.active.accepted_count
+          : (r.latest && r.latest.accepted_count !== null && r.latest.accepted_count !== undefined)
+              ? r.latest.accepted_count : null;
       const completed =
         '<div class="exp-row">' +
           '<span class="label">history</span>' +
-          '<span class="val">' + fmt(r.completed_batches) +
-            ' score_bit completions</span>' +
+          '<span class="val">' + fmt(r.completed_count || 0) +
+            ' run' + ((r.completed_count === 1) ? '' : 's') +
+          (acceptedFrag !== null ? ' · ' + fmt(acceptedFrag) + ' bits accepted (current)' : '') +
+          '</span>' +
         '</div>';
 
-      // Stalled note: explicit, can't-miss line just under the
-      // headline score, explaining WHY the card is tinted red.
+      // Stalled note: explicit explanation just below the headline,
+      // explaining WHY the card is tinted.
       let stalledNote = '';
       if (isStalled) {
-        const ago = r.active.master_polled_seconds_ago;
+        const ago = r.active.heartbeat_seconds_ago;
         const msg =
-          health === 'no_poll_yet'
-            ? 'master crashed before its first poll'
-            : 'master hasn\u2019t checked in for ' + fmtElapsed(ago || 0);
+          health === 'no_progress'
+            ? 'experiment submitted but bootstrap never started'
+            : 'no checkpoint for ' + fmtElapsed(ago || 0) + ' — Oban master may have crashed';
         stalledNote =
           '<div class="exp-stalled-note">\u26a0 ' + escapeHtml(msg) + '</div>';
       }
@@ -1111,12 +1147,65 @@ mix run experiments/humanoid/round-1.exs</code></pre>
         });
     }
 
+    // ── Incidents banner ─────────────────────────────────────
+    // Surfaces system_events.level in (warn,error) over the last
+    // 24h. Banner stays hidden when the list is empty so the
+    // landing page reads "all clear" by default.
+    function refreshIncidents() {
+      fetch('/api/public-status/incidents')
+        .then(r => r.ok ? r.json() : Promise.reject(r.status))
+        .then(d => renderIncidents(d.incidents || []))
+        .catch(() => {
+          // Silent failure: better to keep the banner hidden than
+          // confuse visitors with a false alarm on a transient API
+          // hiccup.
+        });
+    }
+
+    function renderIncidents(rows) {
+      const banner = document.getElementById('incidents');
+      const summary = document.getElementById('incidents-summary');
+      const list = document.getElementById('incidents-list');
+
+      if (!rows.length) {
+        banner.classList.remove('show', 'error', 'expanded');
+        return;
+      }
+
+      const nErr = rows.filter(r => r.level === 'error').length;
+      const nWarn = rows.length - nErr;
+      const parts = [];
+      if (nErr) parts.push(nErr + ' error' + (nErr === 1 ? '' : 's'));
+      if (nWarn) parts.push(nWarn + ' warning' + (nWarn === 1 ? '' : 's'));
+
+      summary.textContent = parts.join(' \u00b7 ') + ' in the last 24h';
+      banner.classList.add('show');
+      banner.classList.toggle('error', nErr > 0);
+
+      list.innerHTML = rows.slice(0, 20).map(r => {
+        const envFrag = r.env_name ? escapeHtml(r.env_name) + ' \u00b7 ' : '';
+        return '<li>' +
+                 '<div class="inc-msg">' + escapeHtml(r.message) + '</div>' +
+                 '<div class="inc-meta">' + envFrag + escapeHtml(r.source) + ' \u00b7 ' +
+                                            escapeHtml(r.level) + ' \u00b7 ' +
+                                            fmtUpdatedAt(r.inserted_at) + '</div>' +
+               '</li>';
+      }).join('');
+    }
+
+    function toggleIncidents() {
+      const banner = document.getElementById('incidents');
+      banner.classList.toggle('expanded');
+    }
+
     refreshStatus();
     refreshExperiments();
     refreshLeaderboard();
+    refreshIncidents();
     setInterval(refreshStatus, 15000);
     setInterval(refreshExperiments, 15000);
     setInterval(refreshLeaderboard, 30000);
+    setInterval(refreshIncidents, 30000);
 
     // ── Live-load SSE wiring ─────────────────────────────────────
     // EventSource subscribes to /api/public-status/stream and gets

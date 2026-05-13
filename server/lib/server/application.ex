@@ -23,6 +23,19 @@ defmodule Server.Application do
       {:ok, pid} ->
         Logger.info("Synthex Hub server listening on :#{port}")
         log_auth_status()
+
+        # Telemetry-based incident recording. Attached AFTER the
+        # supervisor is up so the Repo is available when failed
+        # jobs try to write a system_event. Idempotent across
+        # restarts because :telemetry.attach/4 returns
+        # `{:error, :already_exists}` on duplicates, which we
+        # gracefully ignore in the handler module.
+        case Server.ObanFailureHandler.attach() do
+          :ok -> :ok
+          {:error, :already_exists} -> :ok
+          other -> Logger.warning("ObanFailureHandler attach: #{inspect(other)}")
+        end
+
         {:ok, pid}
 
       err ->

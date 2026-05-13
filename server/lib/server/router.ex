@@ -98,13 +98,28 @@ defmodule Server.Router do
   end
 
   # Per-environment view of in-flight + recently-completed
-  # experiments. Each env collapses its own batch history into a
-  # single "achieved score" so the landing page can show what the
-  # swarm has actually learned, not just job throughput.
+  # experiments. Reads from the `experiments` table (the canonical
+  # CEGAR-run record), not from per-bit Batch rows. One row per
+  # env: status, progress (cegar_iter/iter), accepted bit count,
+  # best reward, baseline, health.
   get "/api/public-status/experiments" do
     conn
     |> put_public_headers()
-    |> send_json(200, %{experiments: Server.Queue.experiments_summary()})
+    |> send_json(200, %{experiments: Server.Experiments.summary()})
+  end
+
+  # Recent system incidents — anything that would otherwise silently
+  # break the swarm. Drives the red banner on the landing page.
+  # 24h window so a brief outage stays visible long enough that
+  # someone notices.
+  get "/api/public-status/incidents" do
+    conn
+    |> put_public_headers()
+    |> send_json(200, %{incidents: Server.Experiments.recent_incidents()})
+  end
+
+  options "/api/public-status/incidents" do
+    send_cors_preflight(conn)
   end
 
   # All-time top contributors. Anonymous workers (`name == "anonymous"`)
@@ -205,6 +220,143 @@ defmodule Server.Router do
   end
 
   # ── Master endpoints ────────────────────────────────────────
+
+  # Submit a new experiment. The hub spawns an Oban-supervised
+  # master loop that runs CEGAR end-to-end on the server, checkpointing
+  # after every accepted bit. No more "ssh to my laptop and
+  # `nohup elixir ...exs`" pattern.
+  #
+  # Body:
+  #
+  #     {
+  #       "env_key": "ant",
+  #       "env_name": "Ant-v5",
+  #       "config": { "bits_per_dim": 3, "depth": 1, ... }
+  #     }
+  #
+  # Rejects with 409 if an experiment for the same env is already
+  # active (one experiment per env at a time).
+  post "/api/master/experiments" do
+    submitter = List.first(get_req_header(conn, "x-submitter"))
+
+    case Server.Experiments.create(conn.body_params, submitter: submitter) do
+      {:ok, exp} ->
+        send_json(conn, 201, %{
+          id: exp.id,
+          env_name: exp.env_name,
+          env_key: exp.env_key,
+          status: exp.status,
+          submitter: exp.submitter
+        })
+
+      {:error, :missing_env} ->
+        send_json(conn, 422, %{
+          error: "missing_env",
+          message: "Body must include env_key (e.g. \"ant\") and env_name (e.g. \"Ant-v5\")"
+        })
+
+      {:error, {:unknown_env, env_key}} ->
+        known = Synthex.Gym.Mujoco.known_envs() |> Enum.map(&Atom.to_string/1) |> Enum.sort()
+
+        send_json(conn, 422, %{
+          error: "unknown_env",
+          env_key: env_key,
+          known_envs: known
+        })
+
+      {:error, :already_running} ->
+        send_json(conn, 409, %{
+          error: "already_running",
+          message: "An experiment for this env is already pending/running"
+        })
+
+      {:error, reason} ->
+        send_json(conn, 500, %{error: "create_failed", reason: inspect(reason)})
+    end
+  end
+
+  get "/api/master/experiments" do
+    limit = parse_limit(conn.params["limit"], default: 50, max: 200)
+
+    experiments =
+      Server.Experiments.list(limit)
+      |> Enum.map(fn e ->
+        %{
+          id: e.id,
+          env_name: e.env_name,
+          env_key: e.env_key,
+          status: e.status,
+          baseline_reward: e.baseline_reward,
+          best_reward: e.best_reward,
+          accepted_count: e.accepted_count,
+          current_cegar_iter: e.current_cegar_iter,
+          current_iter: e.current_iter,
+          inserted_at: e.inserted_at,
+          completed_at: e.completed_at,
+          error: e.error,
+          submitter: e.submitter
+        }
+      end)
+
+    send_json(conn, 200, %{experiments: experiments})
+  end
+
+  get "/api/master/experiments/:id" do
+    case Server.Experiments.get(id) do
+      {:ok, e} ->
+        send_json(conn, 200, %{
+          id: e.id,
+          env_name: e.env_name,
+          env_key: e.env_key,
+          status: e.status,
+          config: e.config,
+          baseline_reward: e.baseline_reward,
+          best_reward: e.best_reward,
+          accepted_count: e.accepted_count,
+          current_cegar_iter: e.current_cegar_iter,
+          current_iter: e.current_iter,
+          bit_progress: e.bit_progress,
+          predicates: e.predicates,
+          inserted_at: e.inserted_at,
+          started_at: e.started_at,
+          completed_at: e.completed_at,
+          error: e.error,
+          submitter: e.submitter
+        })
+
+      {:error, :not_found} ->
+        send_json(conn, 404, %{error: "experiment_not_found"})
+    end
+  end
+
+  # Cancel an experiment. Idempotent: cancelling an already-finished
+  # one is a no-op. The OrphanReaper will clean up any in-flight
+  # chunks within 2 minutes.
+  post "/api/master/experiments/:id/cancel" do
+    case Server.Experiments.get(id) do
+      {:ok, e} ->
+        reason = Map.get(conn.body_params, "reason", "cancelled by operator")
+
+        case e.status do
+          s when s in ["pending", "running"] ->
+            {:ok, _} = Server.Experiments.mark_cancelled(e, reason)
+            Server.Experiments.log_event!(
+              "warn",
+              "master",
+              "experiment cancelled by operator: #{e.env_name} — #{reason}",
+              env_name: e.env_name,
+              experiment_id: e.id
+            )
+            send_json(conn, 200, %{status: "cancelled"})
+
+          other ->
+            send_json(conn, 200, %{status: other, message: "already #{other}"})
+        end
+
+      {:error, :not_found} ->
+        send_json(conn, 404, %{error: "experiment_not_found"})
+    end
+  end
 
   post "/api/master/batches" do
     payload = conn.body_params

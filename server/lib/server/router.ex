@@ -76,7 +76,15 @@ defmodule Server.Router do
   # DB queries per connection). EventSource clients will reconnect
   # automatically when this hits its 5-min duration cap.
   get "/api/public-status/stream" do
-    Server.SSEStream.serve(conn)
+    Server.SSEStream.serve(conn, latest_fn: &Server.MetricsBroker.latest/0)
+  end
+
+  # Per-experiment / per-active-batch streaming aggregates. Layer 1c
+  # of docs/streaming-cegar.md. Pushes live mean / stddev /
+  # rate-per-min for whatever batch is currently in flight on each
+  # active experiment, every second.
+  get "/api/public-status/stream/aggregates" do
+    Server.SSEStream.serve(conn, latest_fn: &Server.AggregateBroker.latest/0)
   end
 
   # CORS preflight for browsers fetching public-status from any

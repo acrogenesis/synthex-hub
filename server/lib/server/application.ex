@@ -14,6 +14,11 @@ defmodule Server.Application do
       # (it queries on init) and BEFORE Bandit (so the route is
       # answerable as soon as Bandit binds the port).
       Server.MetricsBroker,
+      # AggregateBroker mirrors MetricsBroker but caches per-active-
+      # batch streaming aggregates (n, mean, stddev, rate) for the
+      # /api/public-status/stream/aggregates SSE feed. Same start-order
+      # constraints as MetricsBroker: after Repo, before Bandit.
+      Server.AggregateBroker,
       {Bandit, plug: Server.Router, port: port}
     ]
 

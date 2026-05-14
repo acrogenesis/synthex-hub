@@ -99,6 +99,17 @@ defmodule Server.Workers.ExperimentController do
   # the CEGAR step rather than spinning.
   @max_waves_per_step 6
 
+  # Cap on how many bits are in-flight from one wave at once. This
+  # bounds peak master-side memory (each in-flight bit owns a
+  # JSON-encoded candidate batch + a scored result list, both
+  # potentially MBs for high-dim envs like Humanoid). Beyond the
+  # swarm's available core count, additional in-flight master
+  # batches buy nothing because workers serialise them anyway — but
+  # they DO add up to OOMing the 2 GB hub machines. Tune via
+  # `bit_concurrency` in experiment config; default 8 matches
+  # typical hub-machine capacity.
+  @default_bit_concurrency 8
+
   @impl Oban.Worker
   def perform(%Oban.Job{id: job_id, args: %{"experiment_id" => exp_id} = args}) do
     case Experiments.get(exp_id) do
@@ -127,10 +138,11 @@ defmodule Server.Workers.ExperimentController do
     ctx = ExperimentBootstrap.build_context(env_key, exp.config, exp.id)
     cegar_iter = exp.current_cegar_iter
     epsilon = acceptance_epsilon(exp.config)
+    bit_concurrency = bit_concurrency(exp.config)
 
     Logger.info(
       "[Controller] #{exp.env_name} step #{cegar_iter}/#{ctx.cegar_rounds} " <>
-        "(streaming, ε=#{epsilon})"
+        "(streaming, ε=#{epsilon}, bit_concurrency=#{bit_concurrency})"
     )
 
     # collect_states + features against the CURRENT predicates. We
@@ -156,7 +168,17 @@ defmodule Server.Workers.ExperimentController do
         1..@max_waves_per_step,
         initial_state,
         fn wave_num, acc ->
-          case dispatch_wave(exp.id, ctx, features, seeds, cegar_iter, epsilon, wave_num, acc) do
+          case dispatch_wave(
+                 exp.id,
+                 ctx,
+                 features,
+                 seeds,
+                 cegar_iter,
+                 epsilon,
+                 bit_concurrency,
+                 wave_num,
+                 acc
+               ) do
             {:saturated, next_acc} -> {:halt, next_acc}
             {:continue, next_acc} -> {:cont, next_acc}
             {:experiment_finished, next_acc} -> {:halt, next_acc}
@@ -203,7 +225,7 @@ defmodule Server.Workers.ExperimentController do
 
   # ── One wave ────────────────────────────────────────────────
 
-  defp dispatch_wave(exp_id, ctx, features, seeds, cegar_iter, epsilon, wave_num, acc) do
+  defp dispatch_wave(exp_id, ctx, features, seeds, cegar_iter, epsilon, concurrency, wave_num, acc) do
     {:ok, exp_before} = Experiments.get(exp_id)
 
     cond do
@@ -225,8 +247,11 @@ defmodule Server.Workers.ExperimentController do
             {:saturated, acc}
 
           bits ->
+            effective_conc = min(length(bits), concurrency)
+
             Logger.info(
-              "[Controller] wave #{wave_num}: dispatching #{length(bits)} bits at v=#{v_start}"
+              "[Controller] wave #{wave_num}: dispatching #{length(bits)} bits at v=#{v_start} " <>
+                "(in-flight cap=#{effective_conc})"
             )
 
             outcomes =
@@ -235,7 +260,7 @@ defmodule Server.Workers.ExperimentController do
                 fn bit_idx ->
                   {bit_idx, evaluate_bit(preds, bit_idx, features, ctx, seeds)}
                 end,
-                max_concurrency: max(length(bits), 1),
+                max_concurrency: effective_conc,
                 timeout: :infinity,
                 ordered: false
               )
@@ -477,6 +502,10 @@ defmodule Server.Workers.ExperimentController do
   # high-variance envs.
   defp acceptance_epsilon(%{"acceptance_epsilon" => v}) when is_number(v), do: v * 1.0
   defp acceptance_epsilon(_), do: 0.0
+
+  # In-flight bit-batch cap per wave. See `@default_bit_concurrency`.
+  defp bit_concurrency(%{"bit_concurrency" => v}) when is_integer(v) and v > 0, do: v
+  defp bit_concurrency(_), do: @default_bit_concurrency
 
   # ── Heartbeat ───────────────────────────────────────────────
 

@@ -19,6 +19,7 @@
       --accent: #8effc1;
       --accent-dim: #4ea780;
       --warn: #ffb86c;
+      --bad: #ff7a7a;
       --border: #232830;
     }
     @media (prefers-color-scheme: light) {
@@ -32,6 +33,7 @@
         --accent: #14794d;
         --accent-dim: #2a9067;
         --warn: #b95400;
+        --bad: #c0382e;
         --border: #d6d3cc;
       }
     }
@@ -447,15 +449,31 @@
       animation: commit-flash 1.2s ease-out;
     }
 
-    .exp-state.stalled {
+    .exp-state.stalled,
+    .exp-state.idle {
+      color: var(--bad);
+      border-color: var(--bad);
+      background: rgba(255, 99, 99, 0.10);
+      font-weight: 600;
+    }
+    .exp-state.slow {
       color: var(--warn);
       border-color: var(--warn);
       background: rgba(255, 184, 108, 0.10);
       font-weight: 600;
     }
-    /* Tinted card when the master has gone silent — unmistakable
-       at a glance even before reading the badge text. */
-    .exp.stalled {
+    /* Tinted card colour-codes the failure mode at a glance:
+         stalled / idle  → red    (something is wrong)
+         slow            → yellow (working but workload >> swarm)
+       so an operator can triage without reading the badge text. */
+    .exp.stalled,
+    .exp.idle {
+      border-color: var(--bad);
+      background: linear-gradient(180deg,
+                                  rgba(255, 99, 99, 0.06),
+                                  var(--bg-elev));
+    }
+    .exp.slow {
       border-color: var(--warn);
       background: linear-gradient(180deg,
                                   rgba(255, 184, 108, 0.06),
@@ -463,10 +481,21 @@
     }
     .exp-stalled-note {
       font-size: 11px;
-      color: var(--warn);
       margin-top: -2px;
       font-style: italic;
     }
+    .exp-stalled-note.bad  { color: var(--bad); }
+    .exp-stalled-note.warn { color: var(--warn); }
+    /* Compact one-line chunk-flow indicator under the progress
+       row, shown on every running card so operators can see real
+       throughput even when the health badge says `healthy`. */
+    .exp-flow {
+      font-size: 11px;
+      color: var(--fg-dim);
+      margin-top: -2px;
+      font-variant-numeric: tabular-nums;
+    }
+    .exp-flow .num { color: var(--fg); font-weight: 500; }
     /* Incidents banner — surfaced when system_events.level in
        (warn, error) exist in the last 24h. Hidden by default; the
        JS toggles `.show` when the API returns rows. */
@@ -931,12 +960,15 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       }
 
       // Active first, then envs with history but currently idle.
-      // Sort:  stalled cards first (need attention) → healthy live →
-      //        idle envs, then alphabetical inside each tier.
+      // Sort: red cards first (need attention) → yellow (slow) →
+      //       healthy live → not-currently-running envs.
+      //       Then alphabetical inside each tier.
       const tier = r => {
-        if (!r.active) return 2;
+        if (!r.active) return 3;
         const h = r.active.health;
-        return (h === 'stalled' || h === 'no_poll_yet') ? 0 : 1;
+        if (h === 'stalled' || h === 'idle') return 0;
+        if (h === 'slow') return 1;
+        return 2;
       };
       rows.sort((a, b) => {
         const ta = tier(a), tb = tier(b);
@@ -978,19 +1010,29 @@ mix run experiments/humanoid/round-1.exs</code></pre>
 
     function renderExperimentCard(r) {
       const isLive = !!r.active;
-      // Health from /api/public-status/experiments (now backed by
-      // the experiments table — every checkpointed bit refreshes
-      // the row's updated_at timestamp, which is the heartbeat).
-      // Possible values:
-      //   "healthy"      — Oban master active, checkpointing
-      //   "stalled"      — no checkpoint for > 5 min
-      //   "no_progress"  — pending without bootstrap progress
-      //   "unknown"      — anything else (e.g. completed)
+      // Health from /api/public-status/experiments. Backed by the
+      // chunk-flow-aware `compute_health/2` in Server.Experiments,
+      // which consults per-experiment rolling throughput cached by
+      // `Server.AggregateBroker`. Possible values:
+      //   "healthy"  — chunks flowing, bits being committed on
+      //                a reasonable cadence (or boot grace).
+      //   "slow"     — chunks flowing but no bits accepted yet
+      //                after >1h. Swarm too small for the workload;
+      //                ETA is surfaced so the operator can decide.
+      //   "idle"     — heartbeat fresh but no chunk has completed
+      //                for >5 min while a wave is in flight. Workers
+      //                stopped pulling work (or chunks queue jammed).
+      //   "stalled"  — master heartbeat dead for >5 min. Controller
+      //                Oban job crashed; Lifeline will rescue it.
+      //   "unknown"  — anything else (e.g. completed/cancelled).
       const health = isLive ? r.active.health : null;
-      const isStalled = health === 'stalled' || health === 'no_progress';
+      const isBad  = health === 'stalled' || health === 'idle';
+      const isWarn = health === 'slow';
       const stateLabel =
-        isStalled ? 'stalled' :
-        isLive    ? 'live'    : 'idle';
+        health === 'stalled' ? 'stalled' :
+        health === 'idle'    ? 'idle'    :
+        health === 'slow'    ? 'slow'    :
+        isLive               ? 'live'    : 'idle';
 
       // ── primary score line ─────────────────────────────────
       // Order of preference:
@@ -1107,33 +1149,96 @@ mix run experiments/humanoid/round-1.exs</code></pre>
           '</span>' +
         '</div>';
 
-      // Stalled note: explicit explanation just below the headline,
-      // explaining WHY the card is tinted. Three distinct cases:
-      //   stalled     — heartbeat dead → master likely crashed
-      //   no_progress (pending) — submitted but bootstrap never started
-      //   no_progress (running) — master alive but no bits accepted yet,
-      //                           usually means undersized swarm
+      // Health note: one-line explanation under the headline.
+      //   stalled  — controller heartbeat dead (master crashed)
+      //   idle     — heartbeat fresh but chunks stopped flowing
+      //              (worker outage or queue jammed)
+      //   slow     — heartbeat fresh and chunks flowing but the
+      //              workload is so big relative to the swarm that
+      //              no bit will commit for a long time; show ETA
       let stalledNote = '';
-      if (isStalled) {
+      if (isBad || isWarn) {
         const ago = r.active.heartbeat_seconds_ago;
         const elapsed = r.active.elapsed_seconds;
         const status = r.active.status;
-        let msg;
-        if (health === 'no_progress' && status === 'pending') {
-          msg = 'submitted but bootstrap never started';
-        } else if (health === 'no_progress') {
-          msg = 'running for ' + fmtElapsed(elapsed || 0) +
-            ' with no bits accepted — swarm likely too small for the load';
-        } else {
+        const cpm = r.active.chunks_per_min;
+        const eta = r.active.eta_first_bit_seconds;
+        let msg, cls;
+        if (health === 'stalled') {
           msg = 'no checkpoint for ' + fmtElapsed(ago || 0) +
-            ' — Oban master may have crashed';
+            ' — controller Oban job may have crashed';
+          cls = 'bad';
+        } else if (health === 'idle' && status === 'pending') {
+          msg = 'submitted but bootstrap never started';
+          cls = 'bad';
+        } else if (health === 'idle') {
+          // Server-side threshold is 5 min; quoting that directly
+          // here is honest ("we waited 5 minutes before flagging")
+          // and avoids reading nothing from the API.
+          msg = 'no chunk has completed in 5 min — workers may be offline or the chunks queue is jammed';
+          cls = 'bad';
+        } else if (health === 'slow') {
+          const etaPart = (Number.isFinite(eta) && eta > 0)
+            ? ' — ETA ' + fmtElapsed(eta) + ' to first bit at current swarm rate'
+            : '';
+          msg = 'running for ' + fmtElapsed(elapsed || 0) +
+            ' with no bits committed' +
+            (Number.isFinite(cpm) && cpm > 0
+              ? ' (chunks ARE flowing at ~' + cpm + '/min)' : '') +
+            etaPart;
+          cls = 'warn';
+        } else {
+          msg = '';
+          cls = 'warn';
         }
-        stalledNote =
-          '<div class="exp-stalled-note">\u26a0 ' + escapeHtml(msg) + '</div>';
+        if (msg) {
+          stalledNote =
+            '<div class="exp-stalled-note ' + cls + '">\u26a0 ' + escapeHtml(msg) + '</div>';
+        }
+      }
+
+      // Chunk-flow indicator under the progress row — shown for every
+      // running experiment so the operator sees real throughput even
+      // when health = healthy. "0/min" while between waves is correct
+      // and explained by the absence of pending chunks.
+      let flowLine = '';
+      if (isLive) {
+        const cpm = r.active.chunks_per_min;
+        const done = r.active.chunks_done;
+        const total = r.active.chunks_total;
+        const pending = r.active.chunks_pending;
+        const eta = r.active.eta_first_bit_seconds;
+        const nb = r.active.n_active_bits;
+        if (Number.isFinite(cpm) || Number.isFinite(pending)) {
+          const rateFrag =
+            Number.isFinite(cpm)
+              ? '<span class="num">' + fmt(cpm) + '</span> chunks/min'
+              : '0 chunks/min';
+          const sizeFrag =
+            (Number.isFinite(done) && Number.isFinite(total) && total > 0)
+              ? ' · <span class="num">' + fmt(done) + '</span> / ' + fmt(total) + ' chunks'
+              : (Number.isFinite(pending) && pending > 0
+                  ? ' · <span class="num">' + fmt(pending) + '</span> pending'
+                  : '');
+          const bitsFrag =
+            (Number.isFinite(nb) && nb > 0)
+              ? ' · ' + nb + ' bits in flight'
+              : '';
+          const etaFrag =
+            (Number.isFinite(eta) && eta > 0)
+              ? ' · ETA ' + fmtElapsed(eta)
+              : '';
+          flowLine =
+            '<div class="exp-flow">' +
+              rateFrag + sizeFrag + bitsFrag + etaFrag +
+            '</div>';
+        }
       }
 
       const env = r.env_name;
-      const cardCls = 'exp' + (isStalled ? ' stalled' : '');
+      const cardCls = 'exp' +
+        (isBad  ? ' ' + (health || '') : '') +
+        (isWarn ? ' slow' : '');
       // The livebit + commits divs are populated by the aggregates
       // SSE consumer and identified by experiment_id; cached
       // snapshots are re-applied immediately after re-render so they
@@ -1180,6 +1285,7 @@ mix run experiments/humanoid/round-1.exs</code></pre>
           latestLine +
           progressLine +
           progressBar +
+          flowLine +
           '<div class="exp-livebit" data-experiment-id="' + escapeHtml(expId) + '"></div>' +
           '<div class="' + commitsCls + '" data-experiment-id="' + escapeHtml(expId) + '">' +
             (commitsHtml

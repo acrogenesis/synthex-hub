@@ -18,17 +18,32 @@ defmodule Server.Experiments do
   """
 
   import Ecto.Query
-  alias Server.{Experiment, PolicyVersion, Repo, SystemEvent}
+  alias Server.{AggregateBroker, Experiment, PolicyVersion, Repo, SystemEvent}
 
+  # Heartbeat dead → master Oban job has crashed/disappeared.
+  # Surfaces as `stalled` on the dashboard.
   @stalled_threshold_seconds 300
 
-  # An iter that has been alive (heartbeat fresh) but accepted ZERO
-  # bits for this long is almost certainly bottlenecked on something
-  # — typically an undersized worker swarm, an unowned-batch backlog,
-  # or a misconfigured CEGAR run. Distinct from `stalled` (heartbeat
-  # dead → master crashed); this fires when the master is healthy
-  # but the WORK isn't moving.
-  @no_progress_threshold_seconds 60 * 60
+  # Heartbeat fresh AND there's an in-flight wave AND no chunks have
+  # completed in this long → workers stopped pulling work even though
+  # the master wants more. Surfaces as `idle` on the dashboard, the
+  # honest "something is wrong, please look" signal. Distinct from
+  # `slow` (work is flowing, just very slowly relative to bit size).
+  @idle_threshold_seconds 5 * 60
+
+  # First few minutes after a wave is dispatched there will legitimately
+  # be no chunk completions yet — workers need to fetch their first
+  # chunk over HTTP, finish the rollouts, and post the result.
+  # Don't flag `idle` until we're past this grace period.
+  @boot_grace_seconds 5 * 60
+
+  # Heartbeat fresh AND chunks ARE flowing but the swarm is so far
+  # below the workload's bit granularity that no bit will be accepted
+  # for ages. Surfaces as `slow` on the dashboard with an ETA, not
+  # as a red alarm. Replaces the older `no_progress` flag which fired
+  # purely on wall-clock and was wildly misleading on Ant-scale runs
+  # where a single bit legitimately takes days to complete.
+  @slow_after_seconds 60 * 60
 
   # ── Submission ──────────────────────────────────────────────
 
@@ -285,7 +300,8 @@ defmodule Server.Experiments do
     done_iters = max(0, (exp.current_cegar_iter - 1) * max_iters + (exp.current_iter - 1))
     progress = if total_iters > 0, do: done_iters / total_iters, else: 0.0
 
-    {health, polled_ago} = compute_health(exp)
+    flow = AggregateBroker.experiment_flow(exp.id)
+    {health, polled_ago} = compute_health(exp, flow)
 
     %{
       experiment_id: exp.id,
@@ -304,6 +320,17 @@ defmodule Server.Experiments do
       elapsed_seconds: elapsed_seconds(exp.started_at || exp.inserted_at),
       health: health,
       heartbeat_seconds_ago: polled_ago,
+      # Chunk-flow telemetry — the swarm's collective throughput on
+      # this experiment, summed across in-flight bits. Surfaces on
+      # the dashboard as "~N chunks/min · K pending · ETA D days"
+      # so an operator can see at a glance whether `slow` reflects
+      # an undersized swarm (workload >> capacity) or a real outage.
+      chunks_per_min: flow && flow.chunks_per_min,
+      chunks_done: flow && flow.chunks_done,
+      chunks_total: flow && flow.chunks_total,
+      chunks_pending: flow && flow.chunks_pending,
+      n_active_bits: flow && flow.n_active_bits,
+      eta_first_bit_seconds: eta_first_bit_seconds(flow),
       # Streaming CEGAR §Layer 3 surface: monotonically-increasing
       # commit counter + the last few commits so the dashboard can
       # show "v=12 — bit 3 +2.1 @ 14s ago" style live progress.
@@ -311,6 +338,23 @@ defmodule Server.Experiments do
       latest_commits: render_commits(latest_commits(exp.id, 5))
     }
   end
+
+  # Projected wall-clock time until the next bit is accepted, at the
+  # current swarm throughput. Returns nil when we lack a reliable
+  # rate (between waves; just after a commit; no in-flight batches).
+  #
+  # With Jacobi parallel-bit dispatch, all bits in a wave progress at
+  # roughly equal rates because `claim_chunk` fair-shares between
+  # batches; so first-commit time ≈ wave-completion time. That keeps
+  # the projection simple: pending_chunks / chunks_per_min.
+  defp eta_first_bit_seconds(nil), do: nil
+
+  defp eta_first_bit_seconds(%{chunks_per_min: rate, chunks_pending: pending})
+       when is_integer(rate) and rate > 0 and is_integer(pending) and pending > 0 do
+    div(pending * 60, rate)
+  end
+
+  defp eta_first_bit_seconds(_), do: nil
 
   defp render_latest(nil), do: nil
 
@@ -334,21 +378,45 @@ defmodule Server.Experiments do
     }
   end
 
-  # Liveness for an experiment. With the master loop now running as
-  # Oban jobs on the hub, "live" means the most recent
-  # `Server.Workers.Experiment*` heartbeat is fresh. We derive
-  # heartbeat from the experiment row's `updated_at` (every checkpoint
-  # bumps it) plus the existence of an unstarted/executing Oban job
-  # in queue `:master` for this experiment.
-  defp compute_health(%Experiment{status: "pending"} = exp) do
+  # Liveness for an experiment, in four mutually-exclusive states:
+  #
+  #   * `stalled`  — the master Oban job hasn't checkpointed for
+  #                  `@stalled_threshold_seconds`. The controller
+  #                  itself has crashed/disappeared; Lifeline will
+  #                  rescue it. Red.
+  #
+  #   * `idle`     — master heartbeat is fresh AND there's an
+  #                  in-flight wave AND no chunks have completed in
+  #                  the last `@idle_threshold_seconds`. The
+  #                  controller is alive but workers stopped
+  #                  pulling/finishing work — most often a worker
+  #                  outage or a backed-up `chunks` queue. Orange.
+  #
+  #   * `slow`     — master alive, chunks ARE flowing, but the
+  #                  experiment has been running for
+  #                  `@slow_after_seconds` without accepting a bit.
+  #                  Workload bigger than the swarm can crunch in a
+  #                  reasonable time. Honest yellow signal, with an
+  #                  ETA so the operator can decide whether to grow
+  #                  the swarm or shrink the workload. NOT an error.
+  #
+  #   * `healthy`  — anything else: chunks moving, or bits being
+  #                  committed at a reasonable cadence, or the run
+  #                  is still inside its boot grace.
+  #
+  # The flow stats come from `Server.AggregateBroker` which refreshes
+  # once per second; `nil` flow means the broker hasn't observed an
+  # in-flight batch for this experiment yet (just-submitted or
+  # between waves while collect_states/build_features runs).
+  defp compute_health(%Experiment{status: "pending"} = exp, _flow) do
     age = elapsed_seconds(exp.inserted_at) || 0
 
     if age >= @stalled_threshold_seconds,
-      do: {"no_progress", nil},
+      do: {"idle", nil},
       else: {"healthy", nil}
   end
 
-  defp compute_health(%Experiment{status: "running", updated_at: updated_at} = exp)
+  defp compute_health(%Experiment{status: "running", updated_at: updated_at} = exp, flow)
        when not is_nil(updated_at) do
     secs = DateTime.diff(DateTime.utc_now(), updated_at, :second)
     elapsed = elapsed_seconds(exp.started_at || exp.inserted_at) || 0
@@ -356,15 +424,53 @@ defmodule Server.Experiments do
 
     health =
       cond do
-        secs > @stalled_threshold_seconds -> "stalled"
-        bits_done == 0 and elapsed > @no_progress_threshold_seconds -> "no_progress"
-        true -> "healthy"
+        secs > @stalled_threshold_seconds ->
+          "stalled"
+
+        elapsed > @boot_grace_seconds and chunks_stuck?(flow) ->
+          "idle"
+
+        bits_done == 0 and elapsed > @slow_after_seconds and chunks_flowing?(flow) ->
+          "slow"
+
+        true ->
+          "healthy"
       end
 
     {health, secs}
   end
 
-  defp compute_health(_exp), do: {"unknown", nil}
+  defp compute_health(_exp, _flow), do: {"unknown", nil}
+
+  # Is the swarm actively making chunk-level progress right now?
+  # Two signals must agree: (a) AggregateBroker has observed >0
+  # chunks/min over the rolling window, OR (b) `last_result_at`
+  # bumped within the idle threshold. Either is enough — the rolling
+  # rate can read 0 transiently between chunk arrivals on a sparse
+  # swarm, and `last_result_at` covers that case directly.
+  defp chunks_flowing?(nil), do: false
+
+  defp chunks_flowing?(%{chunks_per_min: rate, last_progress_at: last})
+       when is_integer(rate) and rate > 0,
+       do: not stale_progress?(last)
+
+  defp chunks_flowing?(%{last_progress_at: last}), do: not stale_progress?(last)
+
+  # No pending chunks → not "stuck", just between waves.
+  # Pending chunks but no recent completions → genuinely stuck.
+  defp chunks_stuck?(nil), do: false
+  defp chunks_stuck?(%{chunks_pending: pending}) when not is_integer(pending) or pending <= 0,
+    do: false
+
+  defp chunks_stuck?(%{last_progress_at: nil, chunks_pending: pending}) when pending > 0, do: true
+
+  defp chunks_stuck?(%{last_progress_at: last}), do: stale_progress?(last)
+
+  defp stale_progress?(nil), do: true
+
+  defp stale_progress?(%DateTime{} = last) do
+    DateTime.diff(DateTime.utc_now(), last, :second) > @idle_threshold_seconds
+  end
 
   defp elapsed_seconds(nil), do: nil
   defp elapsed_seconds(%DateTime{} = dt), do: DateTime.diff(DateTime.utc_now(), dt, :second)

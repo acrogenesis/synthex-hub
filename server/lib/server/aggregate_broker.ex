@@ -41,6 +41,20 @@ defmodule Server.AggregateBroker do
   in viewer count. The rolling per-batch rate also has to live
   somewhere — we keep a `:queue` of `{ts_ms, n_results}` samples per
   in-flight batch, trimmed to the last `@window_secs` seconds.
+
+  ## Per-experiment flow stats
+
+  Beyond the per-bit `active_bit` payload above, we also compute
+  per-experiment flow aggregates and cache them under a separate
+  ETS key. These are consumed by `Server.Experiments.compute_health/2`
+  to produce honest dashboard health labels — "slow" (chunks
+  flowing but no bit yet) vs "idle" (chunks stopped flowing) vs
+  "healthy". See `experiment_flow/1` below.
+
+  We sum across ALL in-flight batches for the experiment, not just
+  the latest one: Jacobi parallel-bit dispatch keeps N bits open
+  concurrently, so the swarm's per-experiment throughput is the
+  sum across those N batches' rolling rates.
   """
 
   use GenServer
@@ -74,13 +88,52 @@ defmodule Server.AggregateBroker do
     end
   end
 
+  @doc """
+  Per-experiment chunk flow stats — the swarm's collective
+  throughput on this experiment summed across all in-flight bits.
+  Returns `nil` if the broker has no row for the experiment (either
+  it hasn't refreshed yet, or the experiment has no in-flight
+  batches right now — e.g. between waves while the controller
+  collects states and builds features).
+
+  Shape:
+
+      %{
+        chunks_done: 1_828,          # within current in-flight wave
+        chunks_total: 293_488,       # within current in-flight wave
+        chunks_pending: 291_660,
+        chunks_per_min: 7,           # rolling 60-s window, summed across bits
+        last_progress_at: ~U[…],     # max(batches.last_result_at)
+        n_active_bits: 4             # in-flight batches under this experiment
+      }
+  """
+  def experiment_flow(experiment_id) when is_binary(experiment_id) do
+    case :ets.whereis(@table) do
+      :undefined ->
+        nil
+
+      _ ->
+        case :ets.lookup(@table, {:flow, experiment_id}) do
+          [{_, flow}] -> flow
+          [] -> nil
+        end
+    end
+  end
+
+  def experiment_flow(_), do: nil
+
   # ── GenServer ───────────────────────────────────────────────────
 
   @impl true
   def init(_) do
     :ets.new(@table, [:named_table, :public, read_concurrency: true])
     Process.send_after(self(), :refresh, 100)
-    {:ok, %{rings: %{}}}
+    # `rings`: per-batch rolling `n_results` window (existing).
+    # `exp_rings`: per-experiment rolling window of summed completed_chunks
+    #   across in-flight batches, used to derive `chunks_per_min`.
+    # `prev_flow_keys`: experiment_ids we wrote on the previous tick so
+    #   we can evict stale rows whose experiments are no longer active.
+    {:ok, %{rings: %{}, exp_rings: %{}, prev_flow_keys: MapSet.new()}}
   end
 
   @impl true
@@ -132,7 +185,102 @@ defmodule Server.AggregateBroker do
     }
 
     :ets.insert(@table, {:snapshot, snapshot})
-    %{state | rings: pruned_rings}
+
+    # Per-experiment flow stats — summed across all in-flight bits.
+    # See `experiment_flow/1`. Done as a separate pass over the same
+    # `rows` we already fetched so we don't double the DB hit.
+    flow_rows = fetch_all_active_batches()
+
+    {new_exp_rings, current_flow_keys} =
+      refresh_flow_cache(flow_rows, state.exp_rings, now_ms)
+
+    # Evict ETS rows for experiments that disappeared from the active
+    # set since the previous tick — otherwise stale flow stats would
+    # linger forever for cancelled / completed experiments and trick
+    # `compute_health/2` into reporting old throughput numbers.
+    stale_keys = MapSet.difference(state.prev_flow_keys, current_flow_keys)
+    Enum.each(stale_keys, fn exp_id -> :ets.delete(@table, {:flow, exp_id}) end)
+
+    %{state | rings: pruned_rings, exp_rings: new_exp_rings, prev_flow_keys: current_flow_keys}
+  end
+
+  # Same scope as `fetch_active_rows` but returns ALL in-flight
+  # batches per experiment, not just the latest. Per-bit aggregates
+  # use the latest (one card shows one in-flight bit), but per-experiment
+  # flow stats need to sum across every bit currently dispatched —
+  # Jacobi keeps N batches open simultaneously.
+  defp fetch_all_active_batches do
+    from(b in Batch,
+      join: e in Experiment,
+      on: e.id == b.experiment_id,
+      where: b.status in ["pending", "running"] and e.status == "running",
+      select: %{
+        experiment_id: b.experiment_id,
+        batch_id: b.id,
+        completed_chunks: b.completed_chunks,
+        total_chunks: b.total_chunks,
+        last_result_at: b.last_result_at
+      }
+    )
+    |> Repo.all()
+  end
+
+  defp refresh_flow_cache(rows, exp_rings, now_ms) do
+    grouped = Enum.group_by(rows, & &1.experiment_id)
+
+    Enum.reduce(grouped, {exp_rings, MapSet.new()}, fn {exp_id, exp_rows}, {rings_acc, keys_acc} ->
+      done = exp_rows |> Enum.map(&(&1.completed_chunks || 0)) |> Enum.sum()
+      total = exp_rows |> Enum.map(&(&1.total_chunks || 0)) |> Enum.sum()
+      pending = max(total - done, 0)
+      n_active_bits = length(exp_rows)
+
+      last_progress_at =
+        exp_rows
+        |> Enum.map(& &1.last_result_at)
+        |> Enum.reject(&is_nil/1)
+        |> case do
+          [] -> nil
+          ts_list -> Enum.max(ts_list, DateTime)
+        end
+
+      # Reset the ring when `done` drops below the prior sample —
+      # that's the wave-boundary case: the previous wave completed,
+      # a new wave was dispatched, and `done` (summed across
+      # in-flight batches) just snapped back to zero. Without this
+      # the rate would briefly read negative.
+      prior_ring = Map.get(rings_acc, exp_id, :queue.new())
+      base_ring =
+        case :queue.peek_r(prior_ring) do
+          {:value, {_, prev_done}} when prev_done > done -> :queue.new()
+          _ -> prior_ring
+        end
+
+      ring =
+        base_ring
+        |> push_ring(now_ms, done)
+        |> trim_ring(now_ms)
+
+      rate = rate_per_minute(ring, now_ms, done)
+
+      flow = %{
+        chunks_done: done,
+        chunks_total: total,
+        chunks_pending: pending,
+        chunks_per_min: rate,
+        last_progress_at: last_progress_at,
+        n_active_bits: n_active_bits
+      }
+
+      :ets.insert(@table, {{:flow, exp_id}, flow})
+
+      {Map.put(rings_acc, exp_id, ring), MapSet.put(keys_acc, exp_id)}
+    end)
+    |> then(fn {rings, keys} ->
+      # Also prune in-memory exp_rings for experiments that fell out
+      # of the active set, mirroring what we do for per-batch `rings`.
+      pruned = rings |> Enum.filter(fn {k, _} -> MapSet.member?(keys, k) end) |> Map.new()
+      {pruned, keys}
+    end)
   end
 
   # The in-flight batch for each running experiment is the most recent

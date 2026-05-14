@@ -317,6 +317,55 @@
     .exp-state.idle {
       color: var(--fg-dim);
     }
+    /* Live per-bit aggregates strip (Layer 1d of streaming-cegar).
+       SSE-driven; the dot pulses on each update, the row reads as a
+       compact "currently grinding bit X · 300 candidates · best -2820
+       · 45/min" status. Hidden when the experiment has no in-flight
+       batch. */
+    .exp-livebit {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 4px;
+      padding: 4px 8px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 11px;
+      color: var(--fg-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .exp-livebit.has-data {
+      display: flex;
+    }
+    .exp-livebit-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--good);
+      flex-shrink: 0;
+      animation: livebit-pulse 1.6s infinite;
+    }
+    .exp-livebit-label {
+      color: var(--fg-faint);
+    }
+    .exp-livebit-val {
+      color: var(--fg);
+      font-weight: 500;
+    }
+    .exp-livebit-best {
+      color: var(--good);
+      font-weight: 500;
+    }
+    .exp-livebit-sep {
+      color: var(--fg-faint);
+    }
+    @keyframes livebit-pulse {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.35; }
+    }
+
     .exp-state.stalled {
       color: var(--warn);
       border-color: var(--warn);
@@ -829,6 +878,14 @@ mix run experiments/humanoid/round-1.exs</code></pre>
         fetchPolicyInto(slot, env, /*useCache=*/true);
         setTimeout(() => fetchPolicyInto(slot, env, false), 50);
       });
+
+      // Re-paint the per-card live aggregates strip from the cached
+      // SSE snapshot, so the row populates immediately after the
+      // 15-second card re-render instead of blinking empty until the
+      // next SSE tick.
+      if (typeof window.__applyLatestAggregates === 'function') {
+        window.__applyLatestAggregates();
+      }
     }
 
     function cssEscape(s) {
@@ -996,6 +1053,11 @@ mix run experiments/humanoid/round-1.exs</code></pre>
 
       const env = r.env_name;
       const cardCls = 'exp' + (isStalled ? ' stalled' : '');
+      // The livebit div is populated by the aggregates SSE consumer
+      // and identified by experiment_id; cached snapshots are
+      // re-applied immediately after re-render so it doesn't blink
+      // empty every 15 s.
+      const expId = isLive ? r.active.experiment_id : '';
       return (
         '<div class="' + cardCls + '" data-env="' + escapeHtml(env) + '" ' +
              'aria-expanded="false" role="button" tabindex="0" ' +
@@ -1014,6 +1076,7 @@ mix run experiments/humanoid/round-1.exs</code></pre>
           latestLine +
           progressLine +
           progressBar +
+          '<div class="exp-livebit" data-experiment-id="' + escapeHtml(expId) + '"></div>' +
           completed +
           // Lazily filled by toggleExp() on first expansion;
           // visibility driven by .exp[aria-expanded] CSS rules.
@@ -1286,6 +1349,119 @@ mix run experiments/humanoid/round-1.exs</code></pre>
 
       // Defer slightly so the rest of the page paints first.
       setTimeout(connect, 100);
+    })();
+
+    // ── Per-card live aggregates SSE wiring ──────────────────────
+    // EventSource on /api/public-status/stream/aggregates. Each frame
+    // contains one entry per running experiment with the in-flight
+    // batch's running aggregates (n_results, mean, stddev, best,
+    // results/min). We cache the latest snapshot so card re-renders
+    // (every 15 s) re-populate immediately, and update DOM in place
+    // on each tick keyed by data-experiment-id.
+    (function() {
+      let latest = null;
+
+      function fmtNumber(v) {
+        if (v === null || v === undefined) return '·';
+        const n = Number(v);
+        if (!isFinite(n)) return '·';
+        if (Math.abs(n) >= 1000) return n.toLocaleString(undefined, {maximumFractionDigits: 0});
+        if (Math.abs(n) >= 10)   return n.toFixed(1);
+        return n.toFixed(2);
+      }
+
+      function renderLiveBit(a) {
+        // The active_bit payload (see Server.AggregateBroker). Empty
+        // string when there's nothing to show — the card hides the
+        // strip via the .has-data class.
+        if (!a || a.n_results <= 0) return '';
+        const parts = [];
+        parts.push('<span class="exp-livebit-dot" aria-hidden="true"></span>');
+        if (Number.isInteger(a.target_bit)) {
+          parts.push(
+            '<span class="exp-livebit-label">grinding bit</span>' +
+            '<span class="exp-livebit-val">' + a.target_bit + '</span>'
+          );
+          parts.push('<span class="exp-livebit-sep">·</span>');
+        }
+        parts.push(
+          '<span class="exp-livebit-val">' + fmtNumber(a.n_results) + '</span>' +
+          '<span class="exp-livebit-label">cand</span>'
+        );
+        if (a.mean !== null && a.mean !== undefined) {
+          parts.push('<span class="exp-livebit-sep">·</span>');
+          parts.push(
+            '<span class="exp-livebit-label">μ</span>' +
+            '<span class="exp-livebit-val">' + fmtNumber(a.mean) + '</span>'
+          );
+          if (a.stddev !== null && a.stddev !== undefined) {
+            parts.push(
+              '<span class="exp-livebit-label">±</span>' +
+              '<span class="exp-livebit-val">' + fmtNumber(a.stddev) + '</span>'
+            );
+          }
+        }
+        if (a.best_reward !== null && a.best_reward !== undefined) {
+          parts.push('<span class="exp-livebit-sep">·</span>');
+          parts.push(
+            '<span class="exp-livebit-label">best</span>' +
+            '<span class="exp-livebit-best">' + fmtNumber(a.best_reward) + '</span>'
+          );
+        }
+        if (a.results_per_min !== null && a.results_per_min !== undefined && a.results_per_min > 0) {
+          parts.push('<span class="exp-livebit-sep">·</span>');
+          parts.push(
+            '<span class="exp-livebit-val">' + fmtNumber(a.results_per_min) + '</span>' +
+            '<span class="exp-livebit-label">/min</span>'
+          );
+        }
+        return parts.join('');
+      }
+
+      function apply() {
+        if (!latest || !Array.isArray(latest.experiments)) return;
+        const byId = {};
+        latest.experiments.forEach(e => { byId[e.experiment_id] = e; });
+        document.querySelectorAll('.exp-livebit[data-experiment-id]').forEach(el => {
+          const id = el.getAttribute('data-experiment-id');
+          if (!id) {
+            el.classList.remove('has-data');
+            el.innerHTML = '';
+            return;
+          }
+          const exp = byId[id];
+          const html = exp ? renderLiveBit(exp.active_bit) : '';
+          if (html) {
+            el.innerHTML = html;
+            el.classList.add('has-data');
+          } else {
+            el.innerHTML = '';
+            el.classList.remove('has-data');
+          }
+        });
+      }
+
+      // Exposed for renderExperiments(): re-apply cached snapshot to
+      // freshly-rendered cards.
+      window.__applyLatestAggregates = apply;
+
+      let es = null;
+      function connect() {
+        try { if (es) es.close(); } catch(_) {}
+        es = new EventSource('/api/public-status/stream/aggregates');
+        es.onmessage = (e) => {
+          try {
+            const snap = JSON.parse(e.data);
+            if (!snap.loading) {
+              latest = snap;
+              apply();
+            }
+          } catch (_) {}
+        };
+        // EventSource handles reconnection on error automatically.
+      }
+
+      setTimeout(connect, 150);
     })();
   </script>
 </body>

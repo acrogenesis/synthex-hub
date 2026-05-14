@@ -35,7 +35,12 @@ primary_region = 'iad'
 
 [[vm]]
   cpu_kind = 'shared'
-  cpus = 1
+  # shared-cpu-1x maxes out at 2 GB; shared-cpu-2x is required to
+  # allocate 4 GB. The extra core is also welcome — the controller's
+  # parallel-bit wave keeps multiple BEAM schedulers busy at once
+  # while Bandit / SSE / Postgrex still need responsiveness on the
+  # other.
+  cpus = 2
   # Sized for hosting the Oban-supervised CEGAR master in-process
   # alongside Bandit / the worker queue / live SSE fanout. Master
   # `score_bit` batches for high-dim envs (Ant ≈ 300 K candidates,

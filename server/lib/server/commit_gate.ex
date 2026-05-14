@@ -14,16 +14,22 @@ defmodule Server.CommitGate do
        between dispatch and result, the result is *stale* and
        silently discarded.
 
-    2. **Monotone improvement**: the candidate's mean reward must
-       exceed the current best-for-bit by at least
-       `acceptance_epsilon`. No-op replacements are rejected.
+    2. **Monotone policy improvement**: the candidate's mean reward
+       must exceed the experiment's running best
+       (`exp.best_reward`) by at least `acceptance_epsilon`. Under
+       version-reject (1), the candidate was evaluated against the
+       *current* policy's seeds, so this comparison is on the same
+       seed set as the running best — strict policy-level
+       monotonicity follows by construction. We do not consult
+       `best_reward_per_bit` for acceptance; per-bit best is a
+       passive aggregate updated on commit for the dashboard.
 
     3. **Atomic bump + audit**: on success the predicates,
-       `policy_version`, `best_reward_per_bit`, and `accepted_count`
-       are updated, and a `policy_versions` row is inserted, in a
-       single transaction. Either everything commits or nothing does
-       — the audit log is always in lockstep with the experiment
-       row.
+       `policy_version`, `best_reward`, `best_reward_per_bit`, and
+       `accepted_count` are updated, and a `policy_versions` row is
+       inserted, in a single transaction. Either everything commits
+       or nothing does — the audit log is always in lockstep with
+       the experiment row.
 
   ## Why this design
 
@@ -80,8 +86,10 @@ defmodule Server.CommitGate do
                                when it produced this candidate. The
                                gate compares against the current
                                version under `FOR UPDATE`.
-    * `:acceptance_epsilon`  — optional. Minimum reward improvement
-                               (default `1.0e-6`) to count as monotone.
+    * `:acceptance_epsilon`  — optional. Minimum margin by which the
+                               candidate must beat the experiment's
+                               running best reward (default `0.0`)
+                               to count as strict monotone progress.
                                Set higher to filter rollout noise.
     * `:worker_id`           — optional. Foreign key into `workers`
                                recorded on the audit row.
@@ -110,7 +118,7 @@ defmodule Server.CommitGate do
     candidate_term = Keyword.fetch!(opts, :candidate_term)
     reward = Keyword.fetch!(opts, :reward)
     evaluated_at_version = Keyword.fetch!(opts, :evaluated_at_version)
-    epsilon = Keyword.get(opts, :acceptance_epsilon, 1.0e-6)
+    epsilon = Keyword.get(opts, :acceptance_epsilon, 0.0)
     worker_id = Keyword.get(opts, :worker_id)
     metadata = Keyword.get(opts, :metadata, %{})
 
@@ -164,15 +172,14 @@ defmodule Server.CommitGate do
       evaluated_at_version != exp.policy_version ->
         Repo.rollback({:rejected, :stale})
 
-      not improves?(exp.best_reward_per_bit, bit_idx, reward, epsilon) ->
+      not improves_policy?(exp.best_reward, reward, epsilon) ->
         Repo.rollback({:rejected, :no_improvement})
 
       true ->
         new_version = exp.policy_version + 1
         new_predicates = replace_pred(exp.predicates, bit_idx, candidate_term)
         new_best_per_bit = put_best(exp.best_reward_per_bit, bit_idx, reward)
-        new_best_reward = max(reward, exp.best_reward || reward)
-        prev_reward = lookup_best(exp.best_reward_per_bit, bit_idx)
+        prev_reward = exp.best_reward
 
         {:ok, updated} =
           exp
@@ -180,7 +187,7 @@ defmodule Server.CommitGate do
             predicates: new_predicates,
             policy_version: new_version,
             best_reward_per_bit: new_best_per_bit,
-            best_reward: new_best_reward,
+            best_reward: reward,
             accepted_count: exp.accepted_count + 1
           )
           |> Repo.update()
@@ -203,25 +210,16 @@ defmodule Server.CommitGate do
     end
   end
 
-  defp improves?(best_per_bit, bit_idx, reward, epsilon) do
-    case lookup_best(best_per_bit, bit_idx) do
-      nil -> true
-      current -> reward > current + epsilon
-    end
-  end
+  # First commit on a fresh experiment (no recorded best yet): trivially
+  # an improvement. Subsequent commits must beat the current best by
+  # epsilon to qualify as strict monotone progress.
+  defp improves_policy?(nil, _reward, _epsilon), do: true
+  defp improves_policy?(best, reward, epsilon), do: reward > best + epsilon
 
   # Per-bit best is stored as a JSONB map keyed by stringified bit
   # index. Postgres returns string keys regardless of how we wrote
-  # them, so we normalize on read.
-  defp lookup_best(nil, _bit_idx), do: nil
-
-  defp lookup_best(best_per_bit, bit_idx) when is_map(best_per_bit) do
-    case Map.get(best_per_bit, Integer.to_string(bit_idx)) do
-      nil -> Map.get(best_per_bit, bit_idx)
-      v -> v
-    end
-  end
-
+  # them. The gate writes this on commit as a passive aggregate; it
+  # is *not* consulted for the acceptance decision.
   defp put_best(nil, bit_idx, reward),
     do: %{Integer.to_string(bit_idx) => reward}
 

@@ -30,6 +30,7 @@ defmodule Server.ObanFailureHandler do
 
   @master_workers ~w(
     Server.Workers.ExperimentBootstrap
+    Server.Workers.ExperimentController
     Server.Workers.ExperimentCegarIter
     Server.Workers.ExperimentComplete
   )
@@ -142,6 +143,7 @@ defmodule Server.ObanFailureHandler do
   defp format_reason(_), do: "unknown failure"
 
   defp worker_short_name("Server.Workers.ExperimentBootstrap"), do: "bootstrap"
+  defp worker_short_name("Server.Workers.ExperimentController"), do: "controller"
   defp worker_short_name("Server.Workers.ExperimentCegarIter"), do: "iter"
   defp worker_short_name("Server.Workers.ExperimentComplete"), do: "complete"
   defp worker_short_name(other), do: other

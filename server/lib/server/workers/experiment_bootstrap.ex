@@ -44,10 +44,10 @@ defmodule Server.Workers.ExperimentBootstrap do
 
       {:ok, %Experiment{status: "running"} = exp} ->
         # Re-entry after a partial success in a previous attempt:
-        # the row was initialized, but enqueueing the first iter
+        # the row was initialized, but enqueueing the controller
         # failed. Just enqueue and exit.
-        Logger.info("[Bootstrap] experiment #{id} already running; (re-)enqueueing first iter")
-        enqueue_first_iter(exp.id)
+        Logger.info("[Bootstrap] experiment #{id} already running; (re-)enqueueing controller")
+        enqueue_first_step(exp.id)
 
       {:ok, %Experiment{status: "pending"} = exp} ->
         bootstrap(exp)
@@ -94,11 +94,15 @@ defmodule Server.Workers.ExperimentBootstrap do
       metadata: %{"baseline_reward" => baseline_avg}
     )
 
-    enqueue_first_iter(exp.id)
+    enqueue_first_step(exp.id)
   end
 
-  defp enqueue_first_iter(experiment_id) do
-    case Server.Workers.ExperimentCegarIter.new(%{"experiment_id" => experiment_id})
+  # Streaming CEGAR controller (`docs/streaming-cegar.md` §Layer 3 /
+  # "Step 2" of the deployment plan). The legacy Jacobi-iter
+  # `ExperimentCegarIter` is retained one release for emergency
+  # revert but no longer enqueued by bootstrap.
+  defp enqueue_first_step(experiment_id) do
+    case Server.Workers.ExperimentController.new(%{"experiment_id" => experiment_id})
          |> Oban.insert() do
       {:ok, _job} -> :ok
       {:error, reason} -> {:error, reason}

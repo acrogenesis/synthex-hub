@@ -50,13 +50,14 @@ defmodule Server.Application do
     end
   end
 
-  # Self-heal: if the previous node died mid-iter (deploy, crash, OOM),
-  # the iter row sits in `:executing` until Lifeline notices, which can
-  # be up to `rescue_after` (currently 60 min). Our cegar-iter
-  # heartbeat ticks every 60 s, so any executing master job whose
-  # `attempted_at` is older than a couple of beats can't possibly have
-  # a live owner — reset it to `:available` so Oban picks it up
-  # immediately. The `unique` constraint on ExperimentCegarIter still
+  # Self-heal: if the previous node died mid-step (deploy, crash, OOM),
+  # the controller row sits in `:executing` until Lifeline notices, which
+  # can be up to `rescue_after` (currently 5 min). The streaming
+  # controller's heartbeat ticks every 60 s, so any executing master
+  # job whose `attempted_at` is older than a couple of beats can't
+  # possibly have a live owner — reset it to `:available` so Oban
+  # picks it up immediately. The `unique` constraint on
+  # ExperimentController (and legacy ExperimentCegarIter) still
   # protects against double-running.
   defp rescue_orphan_executing_jobs do
     import Ecto.Query

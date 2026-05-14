@@ -41,6 +41,16 @@ defmodule Server.Experiment do
     field :best_reward, :float
     field :accepted_count, :integer, default: 0
 
+    # Streaming-CEGAR §Layer 3 commit gate. `policy_version` is the
+    # monotonically increasing counter the gate enforces; every
+    # accepted commit bumps it by 1 (see `Server.CommitGate`).
+    # `best_reward_per_bit` is the per-bit pool snapshot the gate
+    # consults to decide if a new candidate beats the current best
+    # for its bit. Keyed by stringified bit index; `nil` when a bit
+    # has never been scored at the current version.
+    field :policy_version, :integer, default: 0
+    field :best_reward_per_bit, :map, default: %{}
+
     field :started_at, :utc_datetime_usec
     field :completed_at, :utc_datetime_usec
     field :error, :string
@@ -51,6 +61,7 @@ defmodule Server.Experiment do
   @castable ~w(env_name env_key submitter config status predicates
                current_cegar_iter current_iter bit_shuffle bit_progress
                baseline_reward best_reward accepted_count
+               policy_version best_reward_per_bit
                started_at completed_at error)a
 
   def changeset(experiment, attrs) do

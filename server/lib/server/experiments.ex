@@ -18,7 +18,7 @@ defmodule Server.Experiments do
   """
 
   import Ecto.Query
-  alias Server.{Experiment, Repo, SystemEvent}
+  alias Server.{Experiment, PolicyVersion, Repo, SystemEvent}
 
   @stalled_threshold_seconds 300
 
@@ -303,7 +303,12 @@ defmodule Server.Experiments do
       started_at: exp.started_at || exp.inserted_at,
       elapsed_seconds: elapsed_seconds(exp.started_at || exp.inserted_at),
       health: health,
-      heartbeat_seconds_ago: polled_ago
+      heartbeat_seconds_ago: polled_ago,
+      # Streaming CEGAR §Layer 3 surface: monotonically-increasing
+      # commit counter + the last few commits so the dashboard can
+      # show "v=12 — bit 3 +2.1 @ 14s ago" style live progress.
+      policy_version: exp.policy_version || 0,
+      latest_commits: render_commits(latest_commits(exp.id, 5))
     }
   end
 
@@ -415,5 +420,63 @@ defmodule Server.Experiments do
       }
     )
     |> Repo.all()
+  end
+
+  # ── Streaming CEGAR commit log ────────────────────────────────
+
+  @doc """
+  Most-recent commit-gate accepts for an experiment, newest first.
+  Used by:
+
+    * `render_active/1` — to surface the last few commits on the
+      dashboard card.
+    * `Server.AggregateBroker` — to fan-out commit events via SSE.
+
+  The `predicates` blob is NOT returned (it's the full policy state,
+  too heavy for a frequent SSE tick). Use `Server.Experiment.get/1`
+  + `policy_versions` joins for full audit replay.
+  """
+  def latest_commits(experiment_id, limit \\ 5) do
+    from(v in PolicyVersion,
+      where: v.experiment_id == ^experiment_id,
+      order_by: [desc: v.version],
+      limit: ^limit,
+      select: %{
+        version: v.version,
+        bit_idx: v.bit_idx,
+        prev_reward: v.prev_reward,
+        new_reward: v.new_reward,
+        worker_id: v.worker_id,
+        committed_at: v.inserted_at,
+        metadata: v.metadata
+      }
+    )
+    |> Repo.all()
+  end
+
+  defp render_commits(rows) do
+    Enum.map(rows, fn row ->
+      delta =
+        cond do
+          is_number(row.new_reward) and is_number(row.prev_reward) ->
+            row.new_reward - row.prev_reward
+
+          true ->
+            nil
+        end
+
+      %{
+        version: row.version,
+        bit_idx: row.bit_idx,
+        prev_reward: row.prev_reward,
+        new_reward: row.new_reward,
+        delta: delta,
+        committed_at: row.committed_at,
+        committed_seconds_ago: elapsed_seconds(row.committed_at),
+        worker_id: row.worker_id,
+        cegar_iter: Map.get(row.metadata || %{}, "cegar_iter"),
+        wave: Map.get(row.metadata || %{}, "wave")
+      }
+    end)
   end
 end

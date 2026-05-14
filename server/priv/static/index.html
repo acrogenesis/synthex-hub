@@ -366,6 +366,87 @@
       50%      { opacity: 0.35; }
     }
 
+    /* Policy-version badge in the card head. Sits between the env
+       name and the live/idle state pill. Empty for env cards that
+       never ran under the streaming controller (legacy iter runs
+       leave policy_version = 0). */
+    .exp-version {
+      font-size: 11px;
+      color: var(--fg-dim);
+      font-variant-numeric: tabular-nums;
+      padding: 2px 6px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg-elev);
+      white-space: nowrap;
+      letter-spacing: 0.02em;
+    }
+    .exp-version.bumped {
+      color: var(--good);
+      border-color: var(--good);
+      transition: color 0.6s ease, border-color 0.6s ease;
+    }
+
+    /* Streaming commit log (Step 3b §Layer 3). One row per accepted
+       commit, newest first. Each row reads "v=12 · bit 3 · +2.1 ·
+       14s ago". Cap at 5 rows so the card doesn't grow without
+       bound. */
+    .exp-commits {
+      display: none;
+      margin-top: 6px;
+      padding: 6px 8px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 11px;
+      color: var(--fg-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .exp-commits.has-data {
+      display: block;
+    }
+    .exp-commits-head {
+      font-size: 10px;
+      color: var(--fg-faint);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 4px;
+    }
+    .exp-commit-row {
+      display: flex; gap: 8px; align-items: center;
+      padding: 2px 0;
+    }
+    .exp-commit-v {
+      color: var(--fg);
+      font-weight: 500;
+      min-width: 38px;
+    }
+    .exp-commit-bit {
+      color: var(--fg-dim);
+    }
+    .exp-commit-delta {
+      color: var(--good);
+      font-weight: 500;
+      margin-left: auto;
+    }
+    .exp-commit-delta.neg { color: var(--warn); }
+    .exp-commit-ts {
+      color: var(--fg-faint);
+      font-size: 10px;
+      min-width: 42px;
+      text-align: right;
+    }
+    .exp-commit-row.fresh .exp-commit-v {
+      color: var(--good);
+    }
+    @keyframes commit-flash {
+      0%   { background: rgba(80, 200, 120, 0.18); }
+      100% { background: transparent; }
+    }
+    .exp-commit-row.flash {
+      animation: commit-flash 1.2s ease-out;
+    }
+
     .exp-state.stalled {
       color: var(--warn);
       border-color: var(--warn);
@@ -1053,11 +1134,33 @@ mix run experiments/humanoid/round-1.exs</code></pre>
 
       const env = r.env_name;
       const cardCls = 'exp' + (isStalled ? ' stalled' : '');
-      // The livebit div is populated by the aggregates SSE consumer
-      // and identified by experiment_id; cached snapshots are
-      // re-applied immediately after re-render so it doesn't blink
-      // empty every 15 s.
+      // The livebit + commits divs are populated by the aggregates
+      // SSE consumer and identified by experiment_id; cached
+      // snapshots are re-applied immediately after re-render so they
+      // don't blink empty every 15 s.
       const expId = isLive ? r.active.experiment_id : '';
+
+      // Policy-version badge — Streaming-CEGAR §Layer 3 surface.
+      // Only show when the controller has actually committed at
+      // least once OR when the experiment is live (so the "v=0"
+      // baseline is also visible while the swarm warms up).
+      const v = (isLive && Number.isInteger(r.active.policy_version))
+        ? r.active.policy_version
+        : null;
+      const versionBadge = (v !== null)
+        ? '<span class="exp-version" data-experiment-id="' + escapeHtml(expId) + '" ' +
+            'title="commits accepted under the version-gated streaming controller">' +
+            'v=' + v +
+          '</span>'
+        : '';
+
+      // Commit log strip — only initially populated from the REST
+      // payload; live updates arrive on the aggregates SSE.
+      const initialCommits = (isLive && Array.isArray(r.active.latest_commits))
+        ? r.active.latest_commits : [];
+      const commitsHtml = renderCommitRows(initialCommits);
+      const commitsCls = 'exp-commits' + (commitsHtml ? ' has-data' : '');
+
       return (
         '<div class="' + cardCls + '" data-env="' + escapeHtml(env) + '" ' +
              'aria-expanded="false" role="button" tabindex="0" ' +
@@ -1066,6 +1169,7 @@ mix run experiments/humanoid/round-1.exs</code></pre>
           '<div class="exp-head">' +
             '<div class="exp-env">' +
               escapeHtml(env) +
+              (versionBadge ? ' ' + versionBadge : '') +
               '<span class="exp-chevron" aria-hidden="true">\u203A</span>' +
             '</div>' +
             '<div class="exp-state ' + stateLabel + '">' + stateLabel + '</div>' +
@@ -1077,12 +1181,57 @@ mix run experiments/humanoid/round-1.exs</code></pre>
           progressLine +
           progressBar +
           '<div class="exp-livebit" data-experiment-id="' + escapeHtml(expId) + '"></div>' +
+          '<div class="' + commitsCls + '" data-experiment-id="' + escapeHtml(expId) + '">' +
+            (commitsHtml
+              ? '<div class="exp-commits-head">recent commits</div>' + commitsHtml
+              : '') +
+          '</div>' +
           completed +
           // Lazily filled by toggleExp() on first expansion;
           // visibility driven by .exp[aria-expanded] CSS rules.
           '<div class="exp-policy"></div>' +
         '</div>'
       );
+    }
+
+    // Render a list of commits (newest-first) as a sequence of rows.
+    // Returns an HTML string suitable for direct interpolation into
+    // .exp-commits. Empty string when there are no commits.
+    function renderCommitRows(commits) {
+      if (!commits || commits.length === 0) return '';
+      return commits.slice(0, 5).map(c => {
+        const delta = (typeof c.delta === 'number') ? c.delta : null;
+        const deltaCls = (delta !== null && delta < 0)
+          ? 'exp-commit-delta neg' : 'exp-commit-delta';
+        const deltaTxt = (delta !== null)
+          ? (delta > 0 ? '+' : '') + delta.toFixed(2)
+          : '';
+        const ago = commitAgeSec(c.committed_at);
+        return (
+          '<div class="exp-commit-row" data-version="' + c.version + '">' +
+            '<span class="exp-commit-v">v=' + c.version + '</span>' +
+            '<span class="exp-commit-bit">bit ' + c.bit_idx + '</span>' +
+            '<span class="' + deltaCls + '">' + escapeHtml(deltaTxt) + '</span>' +
+            '<span class="exp-commit-ts">' +
+              (ago !== null ? fmtAgo(ago) : '') +
+            '</span>' +
+          '</div>'
+        );
+      }).join('');
+    }
+
+    function commitAgeSec(committed_at) {
+      if (!committed_at) return null;
+      const t = Date.parse(committed_at);
+      if (Number.isNaN(t)) return null;
+      return Math.max(0, Math.floor((Date.now() - t) / 1000));
+    }
+
+    function fmtAgo(sec) {
+      if (sec < 60)   return sec + 's';
+      if (sec < 3600) return Math.floor(sec / 60) + 'm';
+      if (sec < 86400) return Math.floor(sec / 3600) + 'h';
+      return Math.floor(sec / 86400) + 'd';
     }
 
     function fmtDeltaSpan(delta, label) {
@@ -1422,6 +1571,8 @@ mix run experiments/humanoid/round-1.exs</code></pre>
         if (!latest || !Array.isArray(latest.experiments)) return;
         const byId = {};
         latest.experiments.forEach(e => { byId[e.experiment_id] = e; });
+
+        // Live aggregates strip ("grinding bit X · μ ± σ · best · /min").
         document.querySelectorAll('.exp-livebit[data-experiment-id]').forEach(el => {
           const id = el.getAttribute('data-experiment-id');
           if (!id) {
@@ -1438,6 +1589,54 @@ mix run experiments/humanoid/round-1.exs</code></pre>
             el.innerHTML = '';
             el.classList.remove('has-data');
           }
+        });
+
+        // Version badge — flash green for ~600ms when v bumps live.
+        document.querySelectorAll('.exp-version[data-experiment-id]').forEach(el => {
+          const id = el.getAttribute('data-experiment-id');
+          if (!id) return;
+          const exp = byId[id];
+          if (!exp || !Number.isInteger(exp.policy_version)) return;
+          const newV = exp.policy_version;
+          const prev = parseInt(el.getAttribute('data-version') || '-1', 10);
+          el.textContent = 'v=' + newV;
+          el.setAttribute('data-version', String(newV));
+          if (newV > prev) {
+            el.classList.add('bumped');
+            setTimeout(() => el.classList.remove('bumped'), 700);
+          }
+        });
+
+        // Commit log strip — diff against previously-rendered versions
+        // so a new commit row gets a brief flash animation when it
+        // appears.
+        document.querySelectorAll('.exp-commits[data-experiment-id]').forEach(el => {
+          const id = el.getAttribute('data-experiment-id');
+          if (!id) return;
+          const exp = byId[id];
+          const commits = (exp && Array.isArray(exp.latest_commits))
+            ? exp.latest_commits : [];
+          if (commits.length === 0) {
+            el.classList.remove('has-data');
+            el.innerHTML = '';
+            return;
+          }
+          const prevVersions = new Set(
+            Array.from(el.querySelectorAll('.exp-commit-row'))
+              .map(r => parseInt(r.getAttribute('data-version') || '-1', 10))
+          );
+          el.innerHTML =
+            '<div class="exp-commits-head">recent commits</div>' +
+            renderCommitRows(commits);
+          el.classList.add('has-data');
+          // Flash newly-arrived rows.
+          el.querySelectorAll('.exp-commit-row').forEach(row => {
+            const v = parseInt(row.getAttribute('data-version') || '-1', 10);
+            if (v >= 0 && !prevVersions.has(v)) {
+              row.classList.add('flash');
+              setTimeout(() => row.classList.remove('flash'), 1300);
+            }
+          });
         });
       }
 

@@ -48,7 +48,7 @@ defmodule Server.AggregateBroker do
 
   import Ecto.Query
 
-  alias Server.{Batch, Experiment, Repo}
+  alias Server.{Batch, Experiment, Experiments, Repo}
 
   @table :server_aggregate_cache
   @refresh_ms 1_000
@@ -177,7 +177,8 @@ defmodule Server.AggregateBroker do
         best_reward: b.best_reward,
         baseline_reward: b.baseline_reward,
         completed_chunks: b.completed_chunks,
-        total_chunks: b.total_chunks
+        total_chunks: b.total_chunks,
+        policy_version: e.policy_version
       }
     )
     |> Repo.all()
@@ -215,6 +216,13 @@ defmodule Server.AggregateBroker do
         _ -> nil
       end
 
+    # Streaming-CEGAR §Layer 3 surface: piggyback the most recent
+    # commits on each active-experiment frame so the dashboard
+    # can light up a "v=N — bit 3 +2.1" strip without opening a
+    # second SSE stream. Two reads per refresh per active row;
+    # `latest_commits/2` is indexed on (experiment_id, version).
+    commits = Experiments.latest_commits(row.experiment_id, 5)
+
     payload = %{
       experiment_id: row.experiment_id,
       env_name: row.env_name,
@@ -231,7 +239,23 @@ defmodule Server.AggregateBroker do
         total_chunks: row.total_chunks || 0,
         progress: progress,
         results_per_min: rate
-      }
+      },
+      policy_version: row.policy_version,
+      latest_commits:
+        Enum.map(commits, fn c ->
+          %{
+            version: c.version,
+            bit_idx: c.bit_idx,
+            prev_reward: c.prev_reward,
+            new_reward: c.new_reward,
+            delta:
+              if(is_number(c.new_reward) and is_number(c.prev_reward),
+                do: c.new_reward - c.prev_reward,
+                else: nil
+              ),
+            committed_at: c.committed_at
+          }
+        end)
     }
 
     {payload, new_rings}

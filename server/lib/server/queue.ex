@@ -44,75 +44,170 @@ defmodule Server.Queue do
 
   # ── Master API ──────────────────────────────────────────────
 
+  # ── submit_batch internals ─────────────────────────────────
+  #
+  # The submit path has to be friendly to two stress patterns at
+  # once:
+  #
+  #   1. **Big batches.** A `score_bit` for a high-dim env (Ant's
+  #      tridiag feature pool ≈ 730 K candidates ⇒ 73 K chunks at
+  #      `chunk_size=10`) translates into ~147 multi-row INSERT
+  #      statements of 500 chunks each. The earlier implementation
+  #      built every `Oban.Job` changeset up front (~150 MB heap
+  #      for that one batch) AND wrapped all 147 inserts in a
+  #      single `Repo.transaction`, so one Ecto pool slot was
+  #      pinned for the duration of every submit.
+  #
+  #   2. **Concurrent submits.** The streaming controller's
+  #      parallel-bit wave issues up to `bit_concurrency` batches
+  #      in parallel. With 4 in-flight bits each pinning their own
+  #      pool slot for tens of seconds, the default 10-slot pool
+  #      ran out and DBConnection killed the long-held connections
+  #      mid-statement — workers' `Server.Queue.complete_chunk/3`
+  #      RPCs got `ssl recv: closed`, `bit N crashed` warnings
+  #      propagated into the controller's evaluate_bit rescue
+  #      loop, and every wave silently saturated with zero commits.
+  #      Step "done" log + clean validation = invisible failure.
+  #
+  # The fix is structural:
+  #
+  #   - Insert the batch row in its own short transaction (atomic
+  #     batch creation, then release pool slot immediately).
+  #   - Stream chunk inserts in groups of 500. Each group acquires
+  #     a fresh pool slot, runs one `Oban.insert_all`, and
+  #     releases. Peak heap bounded to 500 changesets at a time;
+  #     pool occupancy bounded to one slot per active group.
+  #   - If any group fails, mark the batch as `failed` so the
+  #     master sees the error rather than hanging on a half-
+  #     populated chunk queue.
+  #
+  # Atomicity trade-off: a crash between the batch row insert and
+  # the chunk-group inserts could leave a `pending` batch with
+  # `completed_chunks < total_chunks` that never advances. That's
+  # benign — `Server.Jobs.OrphanReaper` already reaps stale
+  # `pending` batches whose owning experiment isn't heartbeating.
+
   @doc """
   Submits a batch. Splits `candidates` into chunks of `chunk_size`,
   inserts each chunk as an Oban job, and returns `{:ok, batch}`.
+
+  Friendly to large submissions: the batch row is inserted in a
+  short transaction, then chunk jobs are streamed into the queue
+  in groups of `@chunk_insert_group_size` so individual pool
+  checkouts stay short under concurrent multi-bit dispatch.
   """
   def submit_batch(payload, opts \\ []) do
     submitter = Keyword.get(opts, :submitter)
     candidates = Map.get(payload, "candidates") || Map.get(payload, :candidates) || []
     chunk_size = Map.get(payload, "chunk_size", default_chunk_size())
-    chunks = Enum.chunk_every(candidates, chunk_size)
-    total_chunks = length(chunks)
+
+    n_candidates = length(candidates)
+
+    total_chunks =
+      if n_candidates == 0,
+        do: 0,
+        else: div(n_candidates + chunk_size - 1, chunk_size)
 
     batch_id = "batch_#{:erlang.system_time(:millisecond)}_#{:erlang.unique_integer([:positive])}"
 
-    Repo.transaction(fn ->
-      {:ok, batch} =
-        %Batch{}
-        |> Batch.changeset(%{
-          id: batch_id,
-          name: Map.get(payload, "name"),
-          env_name: Map.get(payload, "env_name", "unknown"),
-          cmd: Map.get(payload, "cmd", "score_bit"),
-          payload: scrub_payload(payload),
-          total_chunks: total_chunks,
-          status: if(total_chunks == 0, do: "completed", else: "pending"),
-          submitter: submitter,
-          experiment_id: extract_experiment_id(payload)
-        })
-        |> Repo.insert()
+    with {:ok, batch} <- insert_batch_row(batch_id, payload, total_chunks, submitter) do
+      cond do
+        total_chunks == 0 ->
+          {:ok, _} =
+            batch
+            |> Batch.changeset(%{completed_at: DateTime.utc_now()})
+            |> Repo.update()
 
-      # Build all chunk Oban jobs as changesets and insert them in one
-      # multi-VALUES INSERT. With ~1000+ chunks, the previous one-job-
-      # per-Oban.insert approach took >15s of round-trips against
-      # Neon and timed out the DB connection on large submissions.
-      params = Map.drop(payload, ["candidates", "chunk_size", "name"])
+          {:ok, batch}
 
-      job_changesets =
-        Enum.with_index(chunks, fn chunk, idx ->
-          chunk_id = "#{batch_id}_chunk_#{idx}"
+        true ->
+          case stream_insert_chunks(batch, candidates, chunk_size, payload) do
+            :ok ->
+              {:ok, batch}
 
-          args = %{
-            "chunk_id" => chunk_id,
-            "batch_id" => batch_id,
-            "chunk_index" => idx,
-            "cmd" => batch.cmd,
-            "env_name" => batch.env_name,
-            "candidates" => chunk,
-            "params" => params
-          }
+            {:error, reason} ->
+              # Mark the batch failed so callers see the error
+              # rather than polling a permanently-pending batch.
+              _ =
+                batch
+                |> Batch.changeset(%{status: "failed"})
+                |> Repo.update()
 
-          BrokerWorker.new(args, meta: %{"chunk_id" => chunk_id, "batch_id" => batch_id})
-        end)
-
-      # Postgres caps a single statement at 65535 bind parameters.
-      # An Oban.Job carries ~30 columns, so we keep each insert_all
-      # call comfortably under that with batches of 500 jobs.
-      if total_chunks > 0 do
-        job_changesets
-        |> Enum.chunk_every(500)
-        |> Enum.each(fn batch_chunks ->
-          _jobs = Oban.insert_all(batch_chunks)
-        end)
+              {:error, reason}
+          end
       end
+    end
+  end
 
-      if total_chunks == 0 do
-        Repo.update!(Batch.changeset(batch, %{completed_at: DateTime.utc_now()}))
-      end
+  # Postgres caps a single statement at 65535 bind parameters and
+  # `Oban.Job` carries ~30 columns, so 500 rows × 30 cols = 15 000
+  # binds — comfortably under the cap, big enough to amortise the
+  # per-statement round-trip.
+  @chunk_insert_group_size 500
 
-      batch
-    end)
+  defp insert_batch_row(batch_id, payload, total_chunks, submitter) do
+    initial_status = if total_chunks == 0, do: "completed", else: "pending"
+
+    %Batch{}
+    |> Batch.changeset(%{
+      id: batch_id,
+      name: Map.get(payload, "name"),
+      env_name: Map.get(payload, "env_name", "unknown"),
+      cmd: Map.get(payload, "cmd", "score_bit"),
+      payload: scrub_payload(payload),
+      total_chunks: total_chunks,
+      status: initial_status,
+      submitter: submitter,
+      experiment_id: extract_experiment_id(payload)
+    })
+    |> Repo.insert()
+  end
+
+  defp stream_insert_chunks(%Batch{} = batch, candidates, chunk_size, payload) do
+    params = Map.drop(payload, ["candidates", "chunk_size", "name"])
+
+    try do
+      candidates
+      |> Stream.chunk_every(chunk_size)
+      |> Stream.with_index()
+      |> Stream.chunk_every(@chunk_insert_group_size)
+      |> Enum.each(fn group ->
+        changesets =
+          Enum.map(group, fn {chunk, idx} ->
+            chunk_id = "#{batch.id}_chunk_#{idx}"
+
+            args = %{
+              "chunk_id" => chunk_id,
+              "batch_id" => batch.id,
+              "chunk_index" => idx,
+              "cmd" => batch.cmd,
+              "env_name" => batch.env_name,
+              "candidates" => chunk,
+              "params" => params
+            }
+
+            BrokerWorker.new(args, meta: %{"chunk_id" => chunk_id, "batch_id" => batch.id})
+          end)
+
+        # One DB call per group; the connection is checked out
+        # only for this `INSERT INTO oban_jobs ... VALUES (...)`
+        # and released before we build the next group. That keeps
+        # the pool available for sibling parallel-bit submits and
+        # for worker `complete_chunk` reports.
+        _ = Oban.insert_all(changesets)
+      end)
+
+      :ok
+    rescue
+      err ->
+        require Logger
+        Logger.error(
+          "[Queue] submit_batch chunk insert failed for #{batch.id}: " <>
+            Exception.message(err)
+        )
+
+        {:error, Exception.message(err)}
+    end
   end
 
   @doc "Look up a batch by id, with progress and (if completed) aggregated results."

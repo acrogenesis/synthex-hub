@@ -56,7 +56,7 @@ All runtime config is via environment variables:
 | `API_TOKEN`                      | (unset → all routes open)                                          | Master-only auth. When set, gates `/api/master/*` and `/api/status`. `/api/worker/*` is always open. |
 | `PORT`                           | `4000`                                                             |                                                |
 | `POOL_SIZE`                      | `10`                                                               | DB pool size                                   |
-| `DEFAULT_CHUNK_SIZE`             | `100`                                                              | Used when master payload omits `chunk_size`    |
+| `DEFAULT_CHUNK_SIZE`             | `10`                                                               | Used when master payload omits `chunk_size`    |
 | `WORKER_HEARTBEAT_TIMEOUT_SECS`  | `120`                                                              | Workers older than this are marked inactive    |
 | `DATABASE_SSL`                   | `false`                                                            | Set `true` for managed Postgres                |
 

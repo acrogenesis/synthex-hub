@@ -18,7 +18,7 @@ defmodule Synthex.Hub.Client do
   require Logger
 
   @default_url "https://synthex.fit/api"
-  @default_chunk_size 100
+  @default_chunk_size 10
   @default_poll_interval_ms 5_000
 
   # 30s was fine for slim polls but catastrophic for batch submits:

@@ -77,7 +77,7 @@ defmodule Synthex.Hub.Scorer do
       Client.new(
         url: Keyword.get(opts, :url),
         token: Keyword.get(opts, :token),
-        chunk_size: Keyword.get(opts, :chunk_size, 100),
+        chunk_size: Keyword.get(opts, :chunk_size, 10),
         poll_interval_ms: Keyword.get(opts, :poll_interval_ms, 5_000),
         request_timeout_ms: Keyword.get(opts, :request_timeout_ms, 30_000),
         max_wait_ms: Keyword.get(opts, :max_wait_ms, 24 * 60 * 60 * 1000)

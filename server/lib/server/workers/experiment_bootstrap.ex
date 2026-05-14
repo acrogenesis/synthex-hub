@@ -127,7 +127,7 @@ defmodule Server.Workers.ExperimentBootstrap do
     base_url = Application.get_env(:server, :local_hub_url, "http://localhost:4000/api")
     token = Application.get_env(:server, :api_token)
 
-    chunk_size = get_int(config, "chunk_size", 100)
+    chunk_size = get_int(config, "chunk_size", 10)
     collect_chunk_size = get_int(config, "collect_states_chunk_size", 4)
     state_stride = get_int(config, "state_stride", 10)
     poll_interval_ms = get_int(config, "poll_interval_ms", 5_000)

@@ -84,7 +84,7 @@ is accepted (all optional, with sensible defaults):
 | `max_iters`                  | 5       | inner iterations per CEGAR round                             |
 | `cegar_rounds`               | 3       | outer rounds; each re-collects states                        |
 | `max_steps`                  | 1000    | per-episode step cap                                         |
-| `chunk_size`                 | 100     | candidates per HTTP chunk to workers                         |
+| `chunk_size`                 | 10      | candidates per HTTP chunk to workers (smaller = more continuous dashboard updates, finer-grained worker failure recovery; see `docs/streaming-cegar.md`) |
 | `collect_states_chunk_size`  | 4       | seeds per `collect_states` chunk                             |
 | `state_stride`               | 10      | subsample factor on per-step state trajectories              |
 | `poll_interval_ms`           | 5000    | hub-internal master poll interval                            |

@@ -122,8 +122,11 @@ granularity useful.
 
 ### Changes
 
-1. `chunk_size` default 100 → 10 episodes in
-   `experiments/configs/*.json` and the server fallback.
+1. `chunk_size` default 100 → 10 *candidates* (each candidate is still
+   evaluated on `n_episodes` episodes) in `experiments/configs/*.json`
+   and the server fallback. This brings per-chunk wall-clock down from
+   ~5 min (3000 episodes) to ~30 s (300 episodes) at typical
+   `n_episodes=30`, which is the granularity the dashboard needs.
 2. `Server.Queue.submit_chunk_result/2` (today: appends to
    `batches.results`) becomes incremental: it atomically updates the
    batch row's running aggregates `(n_episodes_completed, sum_reward,

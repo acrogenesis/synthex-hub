@@ -14,7 +14,7 @@ primary_region = 'iad'
   release_command = '/app/bin/server eval Server.Release.migrate'
 
 [env]
-  DEFAULT_CHUNK_SIZE = '100'
+  DEFAULT_CHUNK_SIZE = '10'
   PORT = '4000'
   WAIT_FOR_DB = ''
   WORKER_HEARTBEAT_TIMEOUT_SECS = '120'

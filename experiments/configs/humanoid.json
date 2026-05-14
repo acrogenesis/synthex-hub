@@ -13,7 +13,7 @@
     "max_iters": 5,
     "cegar_rounds": 3,
     "max_steps": 1000,
-    "chunk_size": 100,
+    "chunk_size": 10,
     "collect_states_chunk_size": 4,
     "state_stride": 10,
     "poll_interval_ms": 5000

@@ -40,6 +40,6 @@ end
 config :server,
   api_token: System.get_env("API_TOKEN"),
   port: String.to_integer(System.get_env("PORT", "4000")),
-  default_chunk_size: String.to_integer(System.get_env("DEFAULT_CHUNK_SIZE", "100")),
+  default_chunk_size: String.to_integer(System.get_env("DEFAULT_CHUNK_SIZE", "10")),
   worker_heartbeat_timeout_secs:
     String.to_integer(System.get_env("WORKER_HEARTBEAT_TIMEOUT_SECS", "120"))

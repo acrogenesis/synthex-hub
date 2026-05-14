@@ -34,7 +34,13 @@ defmodule Server.Queue do
   import Ecto.Query
   alias Server.{Batch, BatchContribution, PolicySnapshot, Repo, BrokerWorker, WorkerNode}
 
-  @default_chunk_size 100
+  # Smaller chunks = more frequent worker contributions = more
+  # granular dashboard updates and per-chunk resilience on worker
+  # failure. Each chunk evaluates `chunk_size` candidates × `n_episodes`
+  # rollouts, so 10 candidates at the typical n_episodes=30 = 300
+  # episodes ≈ 30 s of work per chunk on one core. See
+  # docs/streaming-cegar.md (Layer 1).
+  @default_chunk_size 10
 
   # ── Master API ──────────────────────────────────────────────
 

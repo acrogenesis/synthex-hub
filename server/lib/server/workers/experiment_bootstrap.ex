@@ -127,19 +127,24 @@ defmodule Server.Workers.ExperimentBootstrap do
     Synthex.Gym.Mujoco.init_context(env_key, Keyword.put(opts, :scorer, scorer))
   end
 
+  # Scorer wiring. The controller and bootstrap workers run in the
+  # same BEAM as Server.Queue, so we use `Server.LocalScorer` which
+  # calls `submit_batch/2` directly — no JSON encode + HTTP + decode
+  # + parse loop between the master and the hub. This eliminates
+  # 50–70% of the master's per-batch transient heap and is the
+  # difference between fitting in our 4 GB Fly machines and OOMing
+  # on Ant's tridiag pool (≈ 300 K candidates per `score_bit`).
+  #
+  # `Synthex.Hub.Scorer` is still the right answer for laptop-driven
+  # remote masters; we just don't run those in the Oban path.
   defp build_local_scorer(env_key, experiment_id, config) do
-    base_url = Application.get_env(:server, :local_hub_url, "http://localhost:4000/api")
-    token = Application.get_env(:server, :api_token)
-
     chunk_size = get_int(config, "chunk_size", 10)
     collect_chunk_size = get_int(config, "collect_states_chunk_size", 4)
     state_stride = get_int(config, "state_stride", 10)
-    poll_interval_ms = get_int(config, "poll_interval_ms", 5_000)
+    poll_interval_ms = get_int(config, "poll_interval_ms", 500)
 
-    Synthex.Hub.Scorer.new(
+    Server.LocalScorer.new(
       env_key: env_key,
-      url: base_url,
-      token: token,
       chunk_size: chunk_size,
       collect_states_chunk_size: collect_chunk_size,
       state_stride: state_stride,

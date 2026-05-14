@@ -101,14 +101,18 @@ defmodule Server.Workers.ExperimentController do
 
   # Cap on how many bits are in-flight from one wave at once. This
   # bounds peak master-side memory (each in-flight bit owns a
-  # JSON-encoded candidate batch + a scored result list, both
-  # potentially MBs for high-dim envs like Humanoid). Beyond the
-  # swarm's available core count, additional in-flight master
-  # batches buy nothing because workers serialise them anyway — but
-  # they DO add up to OOMing the 2 GB hub machines. Tune via
-  # `bit_concurrency` in experiment config; default 8 matches
-  # typical hub-machine capacity.
-  @default_bit_concurrency 8
+  # candidate batch + a scored result list, both potentially many
+  # MBs for high-dim envs — Ant's tridiag pool alone is ≈ 280 K
+  # features). Beyond the swarm's available core count, additional
+  # in-flight master batches buy nothing because workers serialise
+  # them anyway — but they DO add up to OOMing the hub.
+  #
+  # 4 is the empirical sweet spot on the current 4 GB Fly machines
+  # paired with `Server.LocalScorer` (which bypasses the master ⇄
+  # bandit JSON roundtrip). Operators can raise this via
+  # `bit_concurrency` once we scale machine RAM or move to a
+  # streaming-chunk-insert path for `submit_batch`.
+  @default_bit_concurrency 4
 
   @impl Oban.Worker
   def perform(%Oban.Job{id: job_id, args: %{"experiment_id" => exp_id} = args}) do

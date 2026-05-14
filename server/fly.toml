@@ -36,9 +36,13 @@ primary_region = 'iad'
 [[vm]]
   cpu_kind = 'shared'
   cpus = 1
-  # Bumped from 512 MB to 2 GB. Master `score_bit` batches can carry
-  # tens of thousands of candidate predicates; decoding the JSON body
-  # in BEAM is roughly 5–10× the source size, so 30 MB raw → ~250 MB
-  # transient allocation. 512 MB was OOM'ing the VM (returned as 502
-  # to the client). 2 GB gives us a 100+ MB body headroom.
-  memory_mb = 2048
+  # Sized for hosting the Oban-supervised CEGAR master in-process
+  # alongside Bandit / the worker queue / live SSE fanout. Master
+  # `score_bit` batches for high-dim envs (Ant ≈ 300 K candidates,
+  # Humanoid larger) carry multi-MB payloads; even with the
+  # in-process LocalScorer bypassing the JSON-to-self loop, the
+  # transient Postgrex bind params for ~30 K chunk inserts plus the
+  # 4-bit parallel wave dispatch routinely peak in the 800 MB–1 GB
+  # range. 4 GB gives a 3× headroom over the observed peak and
+  # leaves room for SSE / dashboard backpressure spikes.
+  memory_mb = 4096

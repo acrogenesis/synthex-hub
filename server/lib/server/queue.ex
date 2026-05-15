@@ -257,6 +257,70 @@ defmodule Server.Queue do
     |> Repo.all()
   end
 
+  @doc """
+  Cancel every in-flight batch belonging to `experiment_id`.
+
+  Used by `Server.Workers.ExperimentController.perform/1` on startup
+  so a retried/Lifeline-rescued controller doesn't accumulate
+  orphans alongside its fresh wave — without this sweep, every
+  controller restart leaves the previous attempt's bit-batches
+  pending in the `chunks` queue, and the swarm's `claim_chunk`
+  fair-share keeps feeding them to workers indefinitely (dead
+  work; nothing polls their results).
+
+  The invariant after this call:
+
+      ∀ batch b owned by `experiment_id`:
+          b.status ∈ {completed, failed, cancelled}
+
+  …so the next dispatch starts from a clean slate. Pending Oban
+  chunk jobs for cancelled batches are flipped to `cancelled`
+  state so workers stop picking them up; chunks already in
+  `executing` will run to completion (a worker mid-rollout is left
+  alone) and their `complete_chunk` call will benignly bump the
+  cancelled batch's counter but never trigger an aggregate update.
+
+  Returns `{:ok, %{batches: n_batches, jobs: n_jobs}}` with the
+  count of cancelled rows for log/audit purposes.
+  """
+  def cancel_experiment_in_flight_batches(experiment_id) when is_binary(experiment_id) do
+    batch_ids =
+      from(b in Batch,
+        where: b.experiment_id == ^experiment_id and b.status in ["pending", "running"],
+        select: b.id
+      )
+      |> Repo.all()
+
+    if batch_ids == [] do
+      {:ok, %{batches: 0, jobs: 0}}
+    else
+      now = DateTime.utc_now()
+
+      # Cancel pending/retryable/scheduled Oban chunk jobs first so
+      # workers don't continue claiming new chunks of the doomed
+      # batches. `executing` jobs are intentionally left alone —
+      # they're already mid-rollout on a worker and harmless.
+      {n_jobs, _} =
+        from(j in Oban.Job,
+          where:
+            j.queue == "chunks" and
+              j.state in ["available", "retryable", "scheduled"] and
+              fragment("?->>'batch_id'", j.args) in ^batch_ids
+        )
+        |> Repo.update_all(
+          set: [state: "cancelled", cancelled_at: now]
+        )
+
+      {n_batches, _} =
+        from(b in Batch, where: b.id in ^batch_ids)
+        |> Repo.update_all(set: [status: "cancelled", completed_at: now])
+
+      {:ok, %{batches: n_batches, jobs: n_jobs}}
+    end
+  end
+
+  def cancel_experiment_in_flight_batches(_), do: {:error, :invalid_experiment_id}
+
   # ── Worker API ──────────────────────────────────────────────
 
   @doc """

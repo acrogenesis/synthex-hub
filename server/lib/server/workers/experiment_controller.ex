@@ -84,7 +84,7 @@ defmodule Server.Workers.ExperimentController do
   require Logger
   import Ecto.Query
 
-  alias Server.{CommitGate, Experiment, Experiments, Repo}
+  alias Server.{CommitGate, Experiment, Experiments, Queue, Repo}
   alias Server.Workers.{ExperimentBootstrap, ExperimentComplete}
   alias Synthex.Core.PrettyPrint
   alias Synthex.Gym.Mujoco
@@ -128,10 +128,57 @@ defmodule Server.Workers.ExperimentController do
         heartbeat = start_heartbeat(job_id, exp.id)
 
         try do
+          # Cancel any in-flight batches left behind by a previous
+          # attempt of this controller job (Lifeline rescue, BEAM
+          # restart, deploy, OOM-kill, …). Without this sweep the
+          # swarm's fair-share `claim_chunk` keeps feeding the dead
+          # batches to workers indefinitely — nothing is polling
+          # their results, so every completed chunk is wasted CPU.
+          #
+          # Safe because:
+          #   * Oban's `unique: [keys: [:experiment_id]]` guarantees
+          #     no concurrent `ExperimentController` instance exists
+          #     for the same experiment, so every in-flight batch
+          #     at perform/1 entry is necessarily from a prior dead
+          #     attempt.
+          #   * If perform/1 returns normally, all its batches are
+          #     already in a terminal state, so the next attempt's
+          #     sweep is a no-op.
+          sweep_orphan_batches!(exp.id)
+
           run_step(exp, args)
         after
           stop_heartbeat(heartbeat)
         end
+    end
+  end
+
+  defp sweep_orphan_batches!(exp_id) do
+    case Queue.cancel_experiment_in_flight_batches(exp_id) do
+      {:ok, %{batches: 0}} ->
+        :ok
+
+      {:ok, %{batches: n_batches, jobs: n_jobs}} ->
+        Logger.info(
+          "[Controller] swept #{n_batches} orphan in-flight batches " <>
+            "(#{n_jobs} pending chunk jobs cancelled) on perform/1 entry"
+        )
+
+        Experiments.log_event!(
+          "warn",
+          "master",
+          "controller resumed after crash/deploy; " <>
+            "cancelled #{n_batches} orphan batch(es) from prior attempt " <>
+            "(#{n_jobs} pending chunks freed)",
+          experiment_id: exp_id,
+          metadata: %{"orphan_batches" => n_batches, "orphan_chunks" => n_jobs}
+        )
+
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("[Controller] orphan sweep failed: #{inspect(reason)}")
+        :ok
     end
   end
 

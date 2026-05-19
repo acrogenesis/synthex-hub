@@ -16,33 +16,74 @@ defmodule Server.Workers.ExperimentController do
          experiment row.
       2. `collect_states` + `build_features` against current preds.
          Reset `best_reward_per_bit` to `{}` (per-step pool).
-      3. Dispatch *waves* until saturation:
-           - Each wave dispatches one Synthex batch per still-open
-             bit, in parallel via `Task.async_stream`. All batches
-             are evaluated against the wave's starting policy
-             version `V`.
-           - As each bit's batch returns, the result is handed to
+      3. Dispatch *passes* until saturation:
+           - Each pass walks the open bits **sequentially**: for
+             every bit, the controller re-reads the experiment row
+             (so it observes the latest `(predicates, policy_version)`
+             reflecting any commit from a prior bit in this same
+             pass), then dispatches one Synthex batch via
+             `Mujoco.optimize_bit`. The result is handed to
              `Server.CommitGate.attempt_commit/1` with
-             `evaluated_at_version: V`. The gate atomically:
-                * rejects as `:stale` if a sibling bit committed
-                  mid-wave (version advanced past V),
-                * rejects as `:no_improvement` if the reward fails
-                  the strict-monotonicity check,
-                * otherwise commits, bumping `policy_version` and
-                  inserting a `policy_versions` audit row.
+             `evaluated_at_version: V_current` — that bit's own
+             freshly-read version, not a stale wave-start snapshot.
+             The gate atomically:
+                * commits if the reward beats the running best by
+                  `acceptance_epsilon`, bumping `policy_version` and
+                  inserting a `policy_versions` audit row,
+                * rejects as `:no_improvement` otherwise.
+             `:stale` rejections are now impossible by construction:
+             we always pass the version we just read.
            - "Still-open" bit definition: a bit is considered
-             settled-at-this-version if it was evaluated against V
-             *and* its result was rejected (or no improvement was
-             produced). Once V advances, all settled bits become
-             open again — their no_improvement verdict at V is no
-             longer authoritative because the policy has changed.
-      4. Saturation = a wave with zero successful commits AND no
-         bit was rejected as stale. At this point no further commit
-         is possible against the current feature pool.
+             settled-at-this-version if it was evaluated against the
+             current `V` *and* its candidate didn't clear the gate.
+             Once any later commit advances `V`, all settled bits
+             become open again — their no_improvement verdict at the
+             old `V` is no longer authoritative because the policy
+             has changed.
+      4. Saturation = a pass with zero successful commits. At this
+         point no further commit is possible against the current
+         feature pool.
       5. Validate the final policy on `validation_seeds()`, log
          iter-done event, advance `current_cegar_iter`.
       6. If more rounds remain → self-enqueue. Otherwise enqueue
          `ExperimentComplete`.
+
+  ## Why sequential, not Jacobi parallel
+
+  The earlier design dispatched all open bits in parallel via
+  `Task.async_stream`, evaluating every one against the same frozen
+  `v_start = exp.policy_version` of the wave. That looked like
+  swarm-friendly parallelism but produced a pathology: at end-of-wave
+  `handle_outcomes` walked the outcomes serially and called the
+  commit gate once per `:improved` entry; the **first** call bumped
+  `policy_version` to `v_start + 1`, and every subsequent call in
+  the same wave was rejected as `:stale` (correctly — those
+  evaluations were against the old baseline, and applying multiple
+  independently-measured improvements would violate strict
+  monotonicity). Net effect: at most one commit per wave, with
+  `N - 1` evaluations discarded as sunk cost on each wave. For an
+  18-bit experiment on HalfCheetah, ~94 % of swarm-side compute was
+  thrown away.
+
+  Sequentializing fixes this without giving up correctness or swarm
+  utilization. Swarm throughput is bounded by `chunks_per_min`, not
+  by how many master-side bit tasks are in flight: any single
+  in-flight batch with > workers chunks already saturates the swarm
+  (HalfCheetah's per-bit batches have ~1320 chunks vs. swarm size in
+  single digits; Ant's are ~220 k). So we lose nothing by holding
+  one batch at a time, and we gain that every bit is evaluated
+  against the **actually-current** policy — every successful commit
+  raises the bar for the next bit, and stale rejections vanish
+  entirely. Best case (near-independent bits, the §11.1 assumption
+  CSHRLSynthesis makes explicit): the pass commits up to N bits in
+  N · per_bit_chunks / C wall-clock. Worst case (highly
+  interdependent bits): same N² scaling the old Jacobi design had
+  — never worse.
+
+  Operators with envs whose per-bit chunk count is smaller than the
+  swarm size can still opt back into parallel dispatch via a
+  `bit_concurrency > 1` setting in the experiment config; the
+  parallel path is preserved exactly for that case.
 
   ## Why one step per Oban job
 
@@ -99,20 +140,22 @@ defmodule Server.Workers.ExperimentController do
   # the CEGAR step rather than spinning.
   @max_waves_per_step 6
 
-  # Cap on how many bits are in-flight from one wave at once. This
-  # bounds peak master-side memory (each in-flight bit owns a
-  # candidate batch + a scored result list, both potentially many
-  # MBs for high-dim envs — Ant's tridiag pool alone is ≈ 280 K
-  # features). Beyond the swarm's available core count, additional
-  # in-flight master batches buy nothing because workers serialise
-  # them anyway — but they DO add up to OOMing the hub.
+  # Cap on how many bits are in-flight at once. Default is 1
+  # (sequential evaluation; see the module doc's "Why sequential,
+  # not Jacobi parallel" section). Workers fair-share chunks across
+  # whatever batches happen to be in flight, so swarm throughput is
+  # invariant to this knob *as long as* the in-flight batches'
+  # combined chunk count saturates the swarm — easy for any
+  # realistic env where one bit's batch alone is hundreds of chunks
+  # vs. a single-digit-to-low-hundreds worker swarm.
   #
-  # 4 is the empirical sweet spot on the current 4 GB Fly machines
-  # paired with `Server.LocalScorer` (which bypasses the master ⇄
-  # bandit JSON roundtrip). Operators can raise this via
-  # `bit_concurrency` once we scale machine RAM or move to a
-  # streaming-chunk-insert path for `submit_batch`.
-  @default_bit_concurrency 4
+  # Operators with envs whose per-bit chunk count is small enough
+  # that one bit can't keep the swarm busy (toy envs, very large
+  # swarms) can raise `bit_concurrency` in the experiment config.
+  # The parallel path falls back to the old wave-snapshot version
+  # for the commit gate, which means it still has the stale-tail
+  # cost — so prefer sequential unless you have a concrete reason.
+  @default_bit_concurrency 1
 
   @impl Oban.Worker
   def perform(%Oban.Job{id: job_id, args: %{"experiment_id" => exp_id} = args}) do
@@ -191,9 +234,11 @@ defmodule Server.Workers.ExperimentController do
     epsilon = acceptance_epsilon(exp.config)
     bit_concurrency = bit_concurrency(exp.config)
 
+    mode = if bit_concurrency <= 1, do: "sequential", else: "parallel"
+
     Logger.info(
       "[Controller] #{exp.env_name} step #{cegar_iter}/#{ctx.cegar_rounds} " <>
-        "(streaming, ε=#{epsilon}, bit_concurrency=#{bit_concurrency})"
+        "(#{mode}, ε=#{epsilon}, bit_concurrency=#{bit_concurrency})"
     )
 
     # collect_states + features against the CURRENT predicates. We
@@ -267,14 +312,27 @@ defmodule Server.Workers.ExperimentController do
         "validation_avg" => val_avg,
         "validation_survived" => val_survived,
         "accepted_in_step" => accepted_in_step,
-        "dispatch_mode" => "streaming"
+        # `dispatch_mode` records the controller's bit-evaluation
+        # strategy so audit replays can tell sequential commits
+        # (every bit against `v_current`) apart from the legacy
+        # parallel commits (all bits against `v_start`).
+        "dispatch_mode" =>
+          if(bit_concurrency(exp.config) <= 1, do: "sequential", else: "parallel")
       }
     )
 
     advance_or_complete(after_step, ctx, val_avg)
   end
 
-  # ── One wave ────────────────────────────────────────────────
+  # ── One pass over the open bits ─────────────────────────────
+  #
+  # Despite the legacy name `dispatch_wave`, this is a single
+  # *pass* over the open bits. With `bit_concurrency = 1` (the
+  # default), the pass walks bits sequentially and the commit gate
+  # observes a fresh `v_current` for each one — see the module
+  # doc's "Why sequential, not Jacobi parallel" section. The `wave`
+  # tag survives in log lines and `system_event` metadata for
+  # continuity with the existing audit trail.
 
   defp dispatch_wave(exp_id, ctx, features, seeds, cegar_iter, epsilon, concurrency, wave_num, acc) do
     {:ok, exp_before} = Experiments.get(exp_id)
@@ -289,44 +347,203 @@ defmodule Server.Workers.ExperimentController do
 
       true ->
         v_start = exp_before.policy_version
-        preds = decode_predicates(exp_before.predicates)
         open = open_bits(ctx.n_bits, v_start, acc)
 
         case open do
           [] ->
-            Logger.info("[Controller] wave #{wave_num}: no open bits (saturated)")
+            Logger.info("[Controller] pass #{wave_num}: no open bits (saturated)")
             {:saturated, acc}
 
           bits ->
             effective_conc = min(length(bits), concurrency)
 
-            Logger.info(
-              "[Controller] wave #{wave_num}: dispatching #{length(bits)} bits at v=#{v_start} " <>
-                "(in-flight cap=#{effective_conc})"
-            )
-
-            outcomes =
-              bits
-              |> Task.async_stream(
-                fn bit_idx ->
-                  {bit_idx, evaluate_bit(preds, bit_idx, features, ctx, seeds)}
-                end,
-                max_concurrency: effective_conc,
-                timeout: :infinity,
-                ordered: false
+            if effective_conc <= 1 do
+              run_pass_sequential(
+                bits,
+                exp_id,
+                ctx,
+                features,
+                seeds,
+                cegar_iter,
+                epsilon,
+                wave_num,
+                acc
               )
-              |> Enum.flat_map(fn
-                {:ok, result} ->
-                  [result]
-
-                {:exit, reason} ->
-                  Logger.warning("[Controller] bit task exited: #{inspect(reason)}")
-                  []
-              end)
-
-            handle_outcomes(outcomes, exp_id, v_start, cegar_iter, ctx, epsilon, wave_num, acc)
+            else
+              run_pass_parallel(
+                bits,
+                exp_id,
+                ctx,
+                features,
+                seeds,
+                cegar_iter,
+                epsilon,
+                effective_conc,
+                v_start,
+                wave_num,
+                acc
+              )
+            end
         end
     end
+  end
+
+  # Sequential pass: walk bits one at a time, re-read the experiment
+  # row before each bit so we evaluate against the latest policy
+  # version. This is the path that makes the strict-monotonicity
+  # commit gate cheap — every result we feed it is by-construction
+  # version-fresh, so no evaluation is wasted as `:stale`.
+  defp run_pass_sequential(bits, exp_id, ctx, features, seeds, cegar_iter, epsilon, wave_num, acc) do
+    {:ok, exp_at_start} = Experiments.get(exp_id)
+    v_start = exp_at_start.policy_version
+
+    Logger.info(
+      "[Controller] pass #{wave_num}: walking #{length(bits)} bits sequentially at v=#{v_start}"
+    )
+
+    {{n_commit, n_stale, n_no_imp, n_finished}, acc1} =
+      Enum.reduce(bits, {{0, 0, 0, 0}, acc}, fn bit_idx, {{nc, ns, ni, nf}, a} ->
+        # Short-circuit cheaply if a prior bit's commit-gate path
+        # observed that the experiment moved out of `running` (e.g.
+        # an operator cancellation landed mid-pass). Avoids issuing
+        # more rollouts to a halted experiment.
+        if nf > 0 do
+          {{nc, ns, ni, nf}, a}
+        else
+          evaluate_one_bit_sequential(
+            bit_idx,
+            {nc, ns, ni, nf},
+            a,
+            exp_id,
+            ctx,
+            features,
+            seeds,
+            cegar_iter,
+            epsilon,
+            wave_num
+          )
+        end
+      end)
+
+    Logger.info(
+      "[Controller] pass #{wave_num} done: " <>
+        "#{n_commit} commits, #{n_stale} stale, #{n_no_imp} no-improvement"
+    )
+
+    cond do
+      n_finished > 0 ->
+        {:experiment_finished, acc1}
+
+      n_commit == 0 ->
+        # No commits this pass — every still-open bit was evaluated
+        # against its own freshly-read version and produced nothing
+        # better. The step has saturated against this feature pool.
+        # (Note: with the sequential path `n_stale` is always 0;
+        # we keep it in the tuple to stay structurally compatible
+        # with the parallel path's `handle_outcomes/8`.)
+        {:saturated, acc1}
+
+      true ->
+        {:continue, acc1}
+    end
+  end
+
+  defp evaluate_one_bit_sequential(
+         bit_idx,
+         {nc, ns, ni, nf},
+         a,
+         exp_id,
+         ctx,
+         features,
+         seeds,
+         cegar_iter,
+         epsilon,
+         wave_num
+       ) do
+    case Experiments.get(exp_id) do
+      {:error, :not_found} ->
+        Logger.info("[Controller] bit #{bit_idx}: experiment gone, halting pass")
+        {{nc, ns, ni, nf + 1}, a}
+
+      {:ok, %Experiment{status: status}} when status != "running" ->
+        Logger.info(
+          "[Controller] bit #{bit_idx}: experiment status=#{status}, halting pass"
+        )
+
+        {{nc, ns, ni, nf + 1}, a}
+
+      {:ok, %Experiment{} = exp_now} ->
+        v_current = exp_now.policy_version
+        preds_now = decode_predicates(exp_now.predicates)
+
+        case evaluate_bit(preds_now, bit_idx, features, ctx, seeds) do
+          :no_improvement ->
+            {{nc, ns, ni + 1, nf},
+             %{a | settled_at: Map.put(a.settled_at, bit_idx, v_current)}}
+
+          {:improved, candidate, reward} ->
+            apply_commit(
+              {bit_idx, candidate, reward},
+              {nc, ns, ni, nf},
+              a,
+              exp_id,
+              v_current,
+              cegar_iter,
+              ctx,
+              epsilon,
+              wave_num
+            )
+        end
+    end
+  end
+
+  # Parallel path — retained for envs where `bit_concurrency > 1`
+  # is configured. Same behavior as before the sequential rewrite:
+  # one wave-start snapshot of `v_start` for all bits, end-of-pass
+  # serial walk of outcomes through the commit gate, stale-tail
+  # cost included. Prefer the sequential path unless you have a
+  # tiny-env reason to keep multiple bits in flight.
+  defp run_pass_parallel(
+         bits,
+         exp_id,
+         ctx,
+         features,
+         seeds,
+         cegar_iter,
+         epsilon,
+         concurrency,
+         v_start,
+         wave_num,
+         acc
+       ) do
+    {:ok, exp_before} = Experiments.get(exp_id)
+    preds = decode_predicates(exp_before.predicates)
+
+    Logger.info(
+      "[Controller] pass #{wave_num}: dispatching #{length(bits)} bits in parallel at v=#{v_start} " <>
+        "(in-flight cap=#{concurrency})"
+    )
+
+    outcomes =
+      bits
+      |> Task.async_stream(
+        fn bit_idx ->
+          {bit_idx, evaluate_bit(preds, bit_idx, features, ctx, seeds)}
+        end,
+        max_concurrency: concurrency,
+        timeout: :infinity,
+        ordered: false
+      )
+      |> Enum.flat_map(fn
+        {:ok, result} ->
+          [result]
+
+        {:exit, reason} ->
+          Logger.warning("[Controller] bit task exited: #{inspect(reason)}")
+          []
+      end)
+
+    handle_outcomes(outcomes, exp_id, v_start, cegar_iter, ctx, epsilon, wave_num, acc)
   end
 
   # `evaluate_bit/5` is a thin wrapper around `optimize_bit` that
@@ -374,7 +591,7 @@ defmodule Server.Workers.ExperimentController do
       end)
 
     Logger.info(
-      "[Controller] wave #{wave_num} done: " <>
+      "[Controller] pass #{wave_num} done (parallel): " <>
         "#{n_commit} commits, #{n_stale} stale, #{n_no_imp} no-improvement"
     )
 
@@ -383,7 +600,7 @@ defmodule Server.Workers.ExperimentController do
         {:experiment_finished, acc1}
 
       n_commit == 0 and n_stale == 0 ->
-        # No commits this wave AND no stale rejections → every open
+        # No commits this pass AND no stale rejections → every open
         # bit was evaluated against the current version and produced
         # nothing better. The step has saturated against this
         # feature pool.

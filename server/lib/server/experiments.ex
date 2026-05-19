@@ -330,7 +330,17 @@ defmodule Server.Experiments do
       chunks_total: flow && flow.chunks_total,
       chunks_pending: flow && flow.chunks_pending,
       n_active_bits: flow && flow.n_active_bits,
-      eta_first_bit_seconds: eta_first_bit_seconds(flow),
+      # Wave-scoped projection: how long until every bit in the
+      # current wave finishes its D0+D1 evaluation. With strict
+      # monotonicity in `Server.CommitGate` this is also the ETA
+      # to the next visible commit on the dashboard (at most one
+      # commit per wave under the current Jacobi-dispatch + serial
+      # post-commit pattern — see docs/streaming-cegar.md §Layer 3
+      # for the architectural fix to that).
+      eta_wave_seconds: eta_wave_seconds(flow, n_bits),
+      wave_dispatched_chunks: flow && flow.wave_dispatched_chunks,
+      wave_done_chunks: flow && flow.wave_done_chunks,
+      wave_total_chunks_estimate: wave_total_chunks_estimate(flow, n_bits),
       # Streaming CEGAR §Layer 3 surface: monotonically-increasing
       # commit counter + the last few commits so the dashboard can
       # show "v=12 — bit 3 +2.1 @ 14s ago" style live progress.
@@ -339,22 +349,82 @@ defmodule Server.Experiments do
     }
   end
 
-  # Projected wall-clock time until the next bit is accepted, at the
-  # current swarm throughput. Returns nil when we lack a reliable
-  # rate (between waves; just after a commit; no in-flight batches).
+  # Projected wall-clock to **wave completion** at the current swarm
+  # rate. Returns nil when we lack a reliable rate (between waves,
+  # just after a commit, or no in-flight batches yet).
   #
-  # With Jacobi parallel-bit dispatch, all bits in a wave progress at
-  # roughly equal rates because `claim_chunk` fair-shares between
-  # batches; so first-commit time ≈ wave-completion time. That keeps
-  # the projection simple: pending_chunks / chunks_per_min.
-  defp eta_first_bit_seconds(nil), do: nil
+  # Why not just `chunks_pending / chunks_per_min`?
+  #
+  # Because each bit in `Synthex.Gym.Mujoco.optimize_bit` produces
+  # TWO `score_bit` batches (depth-0 atomic search + depth-1 compound
+  # refine), and `Task.async_stream` only keeps `bit_concurrency`
+  # bits in flight at a time. The "in-flight only" `chunks_pending`
+  # cycles every few hours as bit-groups churn through D0/D1, so
+  # `pending / rate` reads "a few hours" forever even when the true
+  # wall-clock to wave completion is days. That's the bug the user
+  # caught on HalfCheetah ("has been saying it's going to finish in
+  # some hours since some days").
+  #
+  # The honest answer: project the **whole wave**. Take what's been
+  # dispatched + completed so far in the wave (`wave_dispatched_chunks`)
+  # and add the empirical-per-bit estimate for the bits that haven't
+  # been dispatched yet. Divide by the rate. The estimate is
+  # constructed to stay roughly monotone within a wave — it might
+  # tick up by 10% as more bits dispatch and the empirical-per-bit
+  # estimate sharpens, but it can't oscillate by orders of magnitude
+  # the way `pending / rate` does.
+  defp eta_wave_seconds(nil, _n_bits), do: nil
 
-  defp eta_first_bit_seconds(%{chunks_per_min: rate, chunks_pending: pending})
-       when is_integer(rate) and rate > 0 and is_integer(pending) and pending > 0 do
-    div(pending * 60, rate)
+  defp eta_wave_seconds(%{chunks_per_min: rate} = flow, n_bits)
+       when is_integer(rate) and rate > 0 do
+    total_estimate = wave_total_chunks_estimate(flow, n_bits)
+    done = flow.wave_done_chunks || 0
+
+    pending = max(total_estimate - done, 0)
+
+    cond do
+      pending == 0 -> nil
+      true -> div(pending * 60, rate)
+    end
   end
 
-  defp eta_first_bit_seconds(_), do: nil
+  defp eta_wave_seconds(_, _), do: nil
+
+  # Estimate the total chunks for the *whole* current wave (all
+  # n_bits × D0+D1), even for bits the controller hasn't dispatched
+  # yet. Strategy:
+  #
+  #   * Empirical per-bit cost: `wave_dispatched_chunks /
+  #     wave_dispatched_bits`. For partially-dispatched bits (D0
+  #     done, D1 not yet) this *under*estimates the true cost; that
+  #     only makes the ETA slightly optimistic, never alarmist.
+  #
+  #   * Fallback when nothing has dispatched yet: nil, so the
+  #     caller falls through to no-ETA.
+  #
+  #   * If `n_bits` is unknown (env config unavailable for some
+  #     reason), fall back to just the dispatched chunks — the ETA
+  #     will be valid for what's currently dispatched at least.
+  defp wave_total_chunks_estimate(nil, _n_bits), do: nil
+
+  defp wave_total_chunks_estimate(%{wave_dispatched_chunks: dispatched, wave_dispatched_bits: n_disp},
+                                  n_bits)
+       when is_integer(dispatched) and dispatched > 0 and is_integer(n_disp) and n_disp > 0 do
+    per_bit = dispatched / n_disp
+
+    case n_bits do
+      n when is_integer(n) and n > n_disp ->
+        # Project: known-dispatched chunks + remaining bits × per-bit avg.
+        dispatched + round((n - n_disp) * per_bit)
+
+      _ ->
+        # All bits already dispatched (or n_bits unknown) — what's
+        # dispatched is the whole wave. Cast to integer for callers.
+        dispatched
+    end
+  end
+
+  defp wave_total_chunks_estimate(_flow, _n_bits), do: nil
 
   defp render_latest(nil), do: nil
 

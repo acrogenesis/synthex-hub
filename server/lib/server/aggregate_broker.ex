@@ -62,7 +62,7 @@ defmodule Server.AggregateBroker do
 
   import Ecto.Query
 
-  alias Server.{Batch, Experiment, Experiments, Repo}
+  alias Server.{Batch, Experiment, Experiments, PolicyVersion, Repo}
 
   @table :server_aggregate_cache
   @refresh_ms 1_000
@@ -90,7 +90,10 @@ defmodule Server.AggregateBroker do
 
   @doc """
   Per-experiment chunk flow stats — the swarm's collective
-  throughput on this experiment summed across all in-flight bits.
+  throughput on this experiment summed across all in-flight bits,
+  plus wave-level totals (completed + in-flight) for honest ETA
+  projection.
+
   Returns `nil` if the broker has no row for the experiment (either
   it hasn't refreshed yet, or the experiment has no in-flight
   batches right now — e.g. between waves while the controller
@@ -99,13 +102,29 @@ defmodule Server.AggregateBroker do
   Shape:
 
       %{
-        chunks_done: 1_828,          # within current in-flight wave
-        chunks_total: 293_488,       # within current in-flight wave
+        chunks_done: 1_828,          # currently in-flight batches only
+        chunks_total: 293_488,       # currently in-flight batches only
         chunks_pending: 291_660,
         chunks_per_min: 7,           # rolling 60-s window, summed across bits
         last_progress_at: ~U[…],     # max(batches.last_result_at)
-        n_active_bits: 4             # in-flight batches under this experiment
+        n_active_bits: 4,            # in-flight batches under this experiment
+        # ── wave-scoped totals, for honest "wave completion" ETA ──
+        wave_dispatched_chunks: 23_500,  # sum(total_chunks) across all batches
+                                         # inserted since the most recent commit
+                                         # (or experiment start if no commits).
+        wave_done_chunks: 22_900,        # sum(completed_chunks) over the same set
+        wave_dispatched_bits: 18          # distinct target_bits seen in this wave
       }
+
+  Why wave-scoped totals matter: each bit in `optimize_bit` issues
+  TWO `score_bit` batches (depth-0 atomic search + depth-1
+  compound refine), and `Task.async_stream` keeps only `bit_concurrency`
+  bits in flight at once. The "in-flight only" totals cycle every
+  few hours as bit-groups churn through D0/D1, so an ETA based on
+  them oscillates between minutes and hours forever even though
+  the true wall-clock to wave completion is days. Wave-scoped
+  totals stay monotone within a wave and let `compute_health/2`
+  project an honest ETA.
   """
   def experiment_flow(experiment_id) when is_binary(experiment_id) do
     case :ets.whereis(@table) do
@@ -186,13 +205,16 @@ defmodule Server.AggregateBroker do
 
     :ets.insert(@table, {:snapshot, snapshot})
 
-    # Per-experiment flow stats — summed across all in-flight bits.
-    # See `experiment_flow/1`. Done as a separate pass over the same
-    # `rows` we already fetched so we don't double the DB hit.
-    flow_rows = fetch_all_active_batches()
+    # Per-experiment flow stats — summed across all in-flight bits,
+    # plus wave-scoped totals (completed + in-flight batches since
+    # the last commit, see `experiment_flow/1`). The wave-scoped
+    # totals feed an honest "wave completion" ETA on the dashboard
+    # so the user doesn't see "ETA 2h" for days on end.
+    inflight_rows = fetch_all_active_batches()
+    wave_rows = fetch_wave_batches(inflight_rows)
 
     {new_exp_rings, current_flow_keys} =
-      refresh_flow_cache(flow_rows, state.exp_rings, now_ms)
+      refresh_flow_cache(inflight_rows, wave_rows, state.exp_rings, now_ms)
 
     # Evict ETS rows for experiments that disappeared from the active
     # set since the previous tick — otherwise stale flow stats would
@@ -225,10 +247,141 @@ defmodule Server.AggregateBroker do
     |> Repo.all()
   end
 
-  defp refresh_flow_cache(rows, exp_rings, now_ms) do
-    grouped = Enum.group_by(rows, & &1.experiment_id)
+  # All `score_bit` batches for each experiment that has in-flight
+  # work, restricted to "the current wave": batches inserted since
+  # the most recent commit (or since the experiment started if no
+  # commits yet). Includes status='completed' batches — they're the
+  # work already done in this wave and we need them to compute
+  # honest wave-completion ETAs.
+  #
+  # The wave boundary is `max(experiment.started_at,
+  # latest_policy_version.inserted_at)`. We compute it once per
+  # active experiment rather than join inline because policy_versions
+  # is keyed by (experiment_id, version) and the per-experiment max
+  # is cheap to derive in Elixir from a single fetch.
+  defp fetch_wave_batches(inflight_rows) do
+    active_exp_ids =
+      inflight_rows
+      |> Enum.map(& &1.experiment_id)
+      |> Enum.uniq()
 
-    Enum.reduce(grouped, {exp_rings, MapSet.new()}, fn {exp_id, exp_rows}, {rings_acc, keys_acc} ->
+    case active_exp_ids do
+      [] ->
+        []
+
+      ids ->
+        cutoffs = wave_cutoffs(ids)
+
+        cutoff_pairs =
+          ids
+          |> Enum.flat_map(fn id ->
+            case Map.get(cutoffs, id) do
+              nil -> []
+              ts -> [{id, ts}]
+            end
+          end)
+
+        case cutoff_pairs do
+          [] ->
+            []
+
+          pairs ->
+            # One query: all score_bit batches whose (experiment_id,
+            # inserted_at) is at or after this experiment's wave cutoff.
+            # Postgres handles the per-experiment cutoff via a values
+            # CTE in the WHERE clause via Ecto fragments.
+            exp_ids = Enum.map(pairs, fn {id, _} -> id end)
+            cutoff_map = Map.new(pairs)
+
+            from(b in Batch,
+              where:
+                b.experiment_id in ^exp_ids and
+                  b.cmd == "score_bit",
+              select: %{
+                experiment_id: b.experiment_id,
+                batch_id: b.id,
+                completed_chunks: b.completed_chunks,
+                total_chunks: b.total_chunks,
+                status: b.status,
+                inserted_at: b.inserted_at,
+                target_bit:
+                  fragment("(?->>'target_bit')::int", b.payload)
+              }
+            )
+            |> Repo.all()
+            |> Enum.filter(fn row ->
+              case Map.get(cutoff_map, row.experiment_id) do
+                nil -> false
+                cutoff -> ndt_geq?(row.inserted_at, cutoff)
+              end
+            end)
+        end
+    end
+  end
+
+  # Per-experiment wave cutoff: max(experiment.started_at OR
+  # inserted_at, max(policy_versions.inserted_at)). Returns a map of
+  # experiment_id => NaiveDateTime. Experiments not yet started fall
+  # back to inserted_at. We do this in two roundtrips (experiments,
+  # policy_versions) which is fine — broker ticks once per second
+  # and these tables are small.
+  defp wave_cutoffs(experiment_ids) do
+    exp_starts =
+      from(e in Experiment,
+        where: e.id in ^experiment_ids,
+        select: {e.id, e.started_at, e.inserted_at}
+      )
+      |> Repo.all()
+      |> Map.new(fn {id, started_at, inserted_at} ->
+        {id, started_at || inserted_at}
+      end)
+
+    last_commits =
+      from(v in PolicyVersion,
+        where: v.experiment_id in ^experiment_ids,
+        group_by: v.experiment_id,
+        select: {v.experiment_id, max(v.inserted_at)}
+      )
+      |> Repo.all()
+      |> Map.new()
+
+    Enum.reduce(experiment_ids, %{}, fn id, acc ->
+      start_ts = Map.get(exp_starts, id)
+      commit_ts = Map.get(last_commits, id)
+
+      case {start_ts, commit_ts} do
+        {nil, nil} -> acc
+        {ts, nil} -> Map.put(acc, id, ts)
+        {nil, ts} -> Map.put(acc, id, ts)
+        {a, b} -> Map.put(acc, id, ndt_max(a, b))
+      end
+    end)
+  end
+
+  defp ndt_max(a, b) do
+    if ndt_geq?(a, b), do: a, else: b
+  end
+
+  # Compare two timestamps that may arrive as DateTime or NaiveDateTime
+  # depending on whether the field is `:utc_datetime_usec` (batches.inserted_at,
+  # most policy_versions) or `:naive_datetime` (experiments.started_at).
+  # Normalize to NaiveDateTime for the comparison — they're all UTC here.
+  defp ndt_geq?(%DateTime{} = a, b), do: ndt_geq?(DateTime.to_naive(a), b)
+  defp ndt_geq?(a, %DateTime{} = b), do: ndt_geq?(a, DateTime.to_naive(b))
+
+  defp ndt_geq?(%NaiveDateTime{} = a, %NaiveDateTime{} = b) do
+    case NaiveDateTime.compare(a, b) do
+      :lt -> false
+      _ -> true
+    end
+  end
+
+  defp refresh_flow_cache(inflight_rows, wave_rows, exp_rings, now_ms) do
+    inflight_grouped = Enum.group_by(inflight_rows, & &1.experiment_id)
+    wave_grouped = Enum.group_by(wave_rows, & &1.experiment_id)
+
+    Enum.reduce(inflight_grouped, {exp_rings, MapSet.new()}, fn {exp_id, exp_rows},
+                                                                {rings_acc, keys_acc} ->
       done = exp_rows |> Enum.map(&(&1.completed_chunks || 0)) |> Enum.sum()
       total = exp_rows |> Enum.map(&(&1.total_chunks || 0)) |> Enum.sum()
       pending = max(total - done, 0)
@@ -242,6 +395,24 @@ defmodule Server.AggregateBroker do
           [] -> nil
           ts_list -> Enum.max(ts_list, DateTime)
         end
+
+      # Wave-scoped aggregates: completed + in-flight `score_bit`
+      # batches in this experiment's current wave. See
+      # `fetch_wave_batches/1` for the definition of "wave".
+      wave_rows_for_exp = Map.get(wave_grouped, exp_id, [])
+
+      wave_dispatched_chunks =
+        wave_rows_for_exp |> Enum.map(&(&1.total_chunks || 0)) |> Enum.sum()
+
+      wave_done_chunks =
+        wave_rows_for_exp |> Enum.map(&(&1.completed_chunks || 0)) |> Enum.sum()
+
+      wave_dispatched_bits =
+        wave_rows_for_exp
+        |> Enum.map(& &1.target_bit)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
+        |> length()
 
       # Reset the ring when `done` drops below the prior sample —
       # that's the wave-boundary case: the previous wave completed,
@@ -268,7 +439,10 @@ defmodule Server.AggregateBroker do
         chunks_pending: pending,
         chunks_per_min: rate,
         last_progress_at: last_progress_at,
-        n_active_bits: n_active_bits
+        n_active_bits: n_active_bits,
+        wave_dispatched_chunks: wave_dispatched_chunks,
+        wave_done_chunks: wave_done_chunks,
+        wave_dispatched_bits: wave_dispatched_bits
       }
 
       :ets.insert(@table, {{:flow, exp_id}, flow})

@@ -1156,13 +1156,15 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       //   slow     — heartbeat fresh and chunks flowing but the
       //              workload is so big relative to the swarm that
       //              no bit will commit for a long time; show ETA
+      //              to the next visible commit (= wave completion
+      //              under strict monotonicity).
       let stalledNote = '';
       if (isBad || isWarn) {
         const ago = r.active.heartbeat_seconds_ago;
         const elapsed = r.active.elapsed_seconds;
         const status = r.active.status;
         const cpm = r.active.chunks_per_min;
-        const eta = r.active.eta_first_bit_seconds;
+        const eta = r.active.eta_wave_seconds;
         let msg, cls;
         if (health === 'stalled') {
           msg = 'no checkpoint for ' + fmtElapsed(ago || 0) +
@@ -1178,8 +1180,11 @@ mix run experiments/humanoid/round-1.exs</code></pre>
           msg = 'no chunk has completed in 5 min — workers may be offline or the chunks queue is jammed';
           cls = 'bad';
         } else if (health === 'slow') {
+          // ETA is wave-completion (== next visible commit). Phrased
+          // honestly so users don't expect "first bit in 2h" when
+          // the true wall-clock to a visible commit is days.
           const etaPart = (Number.isFinite(eta) && eta > 0)
-            ? ' — ETA ' + fmtElapsed(eta) + ' to first bit at current swarm rate'
+            ? ' — ETA ' + fmtElapsed(eta) + ' to next visible commit at current swarm rate'
             : '';
           msg = 'running for ' + fmtElapsed(elapsed || 0) +
             ' with no bits committed' +
@@ -1201,24 +1206,31 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       // running experiment so the operator sees real throughput even
       // when health = healthy. "0/min" while between waves is correct
       // and explained by the absence of pending chunks.
+      //
+      // The "X / Y chunks" count is **wave-scoped** (completed +
+      // in-flight `score_bit` batches since the last commit), not
+      // just the currently in-flight batches. Same for the ETA —
+      // see Server.Experiments.eta_wave_seconds/2 for the rationale.
       let flowLine = '';
       if (isLive) {
         const cpm = r.active.chunks_per_min;
-        const done = r.active.chunks_done;
-        const total = r.active.chunks_total;
-        const pending = r.active.chunks_pending;
-        const eta = r.active.eta_first_bit_seconds;
+        // Wave-scoped totals: stay monotone within a wave, so the
+        // "X / Y" counter doesn't oscillate as bit-groups churn.
+        const done = r.active.wave_done_chunks;
+        const total = r.active.wave_total_chunks_estimate;
+        const inflightPending = r.active.chunks_pending;
+        const eta = r.active.eta_wave_seconds;
         const nb = r.active.n_active_bits;
-        if (Number.isFinite(cpm) || Number.isFinite(pending)) {
+        if (Number.isFinite(cpm) || Number.isFinite(inflightPending)) {
           const rateFrag =
             Number.isFinite(cpm)
               ? '<span class="num">' + fmt(cpm) + '</span> chunks/min'
               : '0 chunks/min';
           const sizeFrag =
             (Number.isFinite(done) && Number.isFinite(total) && total > 0)
-              ? ' · <span class="num">' + fmt(done) + '</span> / ' + fmt(total) + ' chunks'
-              : (Number.isFinite(pending) && pending > 0
-                  ? ' · <span class="num">' + fmt(pending) + '</span> pending'
+              ? ' · <span class="num">' + fmt(done) + '</span> / ' + fmt(total) + ' chunks in wave'
+              : (Number.isFinite(inflightPending) && inflightPending > 0
+                  ? ' · <span class="num">' + fmt(inflightPending) + '</span> in-flight pending'
                   : '');
           const bitsFrag =
             (Number.isFinite(nb) && nb > 0)
@@ -1226,7 +1238,7 @@ mix run experiments/humanoid/round-1.exs</code></pre>
               : '';
           const etaFrag =
             (Number.isFinite(eta) && eta > 0)
-              ? ' · ETA ' + fmtElapsed(eta)
+              ? ' · wave ETA ' + fmtElapsed(eta)
               : '';
           flowLine =
             '<div class="exp-flow">' +

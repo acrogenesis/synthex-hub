@@ -31,3 +31,10 @@ venv/
 
 # ── Docker / compose state ──────────────────────────────────
 postgres-data/
+
+# ── Runtime artefacts from local experiment / recording scripts ─
+*.pid
+ant_snapshot_videos/
+*_snapshot_videos/
+*_videos/
+

@@ -1228,8 +1228,14 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       //              no bit will commit for a long time; show ETA
       //              to the next visible commit (= wave completion
       //              under strict monotonicity).
+      // Guard on `isLive` too: my `isWarn` extension covers the
+      // non-live "stopped" state (last run produced accepted bits
+      // but failed/cancelled), and that branch must NOT touch
+      // `r.active.*` — there's no active row. The failure reason for
+      // a non-live `stopped` card is already surfaced by
+      // `lastRunLine` further down; no top-of-card note needed.
       let stalledNote = '';
-      if (isBad || isWarn) {
+      if (isLive && (isBad || isWarn)) {
         const ago = r.active.heartbeat_seconds_ago;
         const elapsed = r.active.elapsed_seconds;
         const status = r.active.status;

@@ -154,10 +154,15 @@ defmodule Server.Router do
     })
   end
 
-  # Latest policy snapshot for an env. Public; CORS-enabled so
+  # Latest policy snapshot for a lineage. Public; CORS-enabled so
   # the showcase / landing page can fetch from any origin.
-  get "/api/public-status/policies/:env_name" do
-    case Server.Queue.get_policy_snapshot(env_name) do
+  #
+  # Keyed by env_policy_id (UUID) — see Server.PolicySnapshot's
+  # moduledoc for why per-lineage is the natural grain (two
+  # configs on the same env_name are independent lineages and
+  # have independent snapshots).
+  get "/api/public-status/policies/:env_policy_id" do
+    case Server.Queue.get_policy_snapshot(env_policy_id) do
       {:ok, snapshot} ->
         conn
         |> put_public_headers()
@@ -166,11 +171,11 @@ defmodule Server.Router do
       {:error, :not_found} ->
         conn
         |> put_public_headers()
-        |> send_json(404, %{error: "snapshot_not_found", env_name: env_name})
+        |> send_json(404, %{error: "snapshot_not_found", env_policy_id: env_policy_id})
     end
   end
 
-  options "/api/public-status/policies/:_env_name" do
+  options "/api/public-status/policies/:_env_policy_id" do
     send_cors_preflight(conn)
   end
 
@@ -590,6 +595,7 @@ defmodule Server.Router do
 
   defp render_snapshot(%Server.PolicySnapshot{} = s) do
     %{
+      env_policy_id: s.env_policy_id,
       env_name: s.env_name,
       policy_code: s.policy_code,
       code_language: s.code_language,

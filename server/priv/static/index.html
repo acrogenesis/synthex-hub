@@ -1030,9 +1030,11 @@ mix run experiments/humanoid/round-1.exs</code></pre>
         }
         card.setAttribute('aria-expanded', 'true');
         const slot = card.querySelector('.exp-policy');
+        const envPolicyId = card.getAttribute('data-env-policy-id');
         const envName = card.getAttribute('data-env');
-        fetchPolicyInto(slot, envName, /*useCache=*/true);
-        setTimeout(() => fetchPolicyInto(slot, envName, false), 50);
+        if (!envPolicyId) return;
+        fetchPolicyInto(slot, envPolicyId, envName, /*useCache=*/true);
+        setTimeout(() => fetchPolicyInto(slot, envPolicyId, envName, false), 50);
       });
 
       // Re-paint the per-card live aggregates strip from the cached
@@ -1398,6 +1400,7 @@ mix run experiments/humanoid/round-1.exs</code></pre>
         '<div class="' + cardCls + '" ' +
              'data-card-key="' + escapeHtml(cardKey) + '" ' +
              'data-env="' + escapeHtml(env) + '" ' +
+             'data-env-policy-id="' + escapeHtml(r.env_policy_id || '') + '" ' +
              'data-config-sig="' + escapeHtml(r.config_sig || '') + '" ' +
              'aria-expanded="false" role="button" tabindex="0" ' +
              'onclick="toggleExp(this, event)" ' +
@@ -1492,32 +1495,42 @@ mix run experiments/humanoid/round-1.exs</code></pre>
     // Collapsed state keeps the card uncluttered with just score
     // + progress; expanded state reveals the current synthesized
     // policy as Python pseudocode. We cache snapshots in memory
-    // and track which env cards are expanded so the 15-second
+    // keyed by env_policy_id (the lineage UUID) so two cards on
+    // the same env_name with different policy-shape configs each
+    // get their own snapshot. The expansion-state set is also
+    // keyed per card (env_name + config_sig) so the 15-second
     // grid refresh doesn't collapse the policy panel from under
     // a reader's nose.
     const policyCache = {};
     let expandedEnvs = new Set();
 
-    function fetchPolicyInto(slot, env, useCache) {
-      if (useCache && policyCache[env]) {
+    function fetchPolicyInto(slot, envPolicyId, envName, useCache) {
+      if (!envPolicyId) {
         slot.dataset.loaded = '1';
-        slot.innerHTML = renderPolicyBlock(policyCache[env], env);
+        slot.innerHTML =
+          '<div class="policy-head"><span>current policy</span></div>' +
+          '<div class="policy-empty">no lineage attached yet</div>';
+        return;
+      }
+      if (useCache && policyCache[envPolicyId]) {
+        slot.dataset.loaded = '1';
+        slot.innerHTML = renderPolicyBlock(policyCache[envPolicyId], envName);
         return;
       }
       slot.innerHTML =
         '<div class="policy-head"><span>current policy</span><span>loading…</span></div>' +
         '<div class="policy-empty">fetching latest snapshot…</div>';
 
-      fetch('/api/public-status/policies/' + encodeURIComponent(env))
+      fetch('/api/public-status/policies/' + encodeURIComponent(envPolicyId))
         .then(r => {
           if (r.status === 404) return { _missing: true };
           if (!r.ok) return Promise.reject('HTTP ' + r.status);
           return r.json();
         })
         .then(s => {
-          policyCache[env] = s;
+          policyCache[envPolicyId] = s;
           slot.dataset.loaded = '1';
-          slot.innerHTML = renderPolicyBlock(s, env);
+          slot.innerHTML = renderPolicyBlock(s, envName);
         })
         .catch(reason => {
           slot.dataset.loaded = '1';
@@ -1534,11 +1547,12 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       // Expansion is tracked per-card-key (env_name + config_sig) so
       // two lineages for the same env (different policy-shape configs)
       // remember their expansion state independently. The policy
-      // snapshot fetch still goes via env_name because the snapshot
-      // table is keyed by env (one canonical snapshot per env, set
-      // by whichever lineage's controller pushed most recently).
+      // snapshot fetch goes via env_policy_id so each card gets its
+      // own lineage's snapshot — two HalfCheetah cards with and
+      // without tridiag render distinct policy code.
       const cardKey = card.getAttribute('data-card-key') || card.getAttribute('data-env');
-      const env = card.getAttribute('data-env');
+      const envPolicyId = card.getAttribute('data-env-policy-id');
+      const envName = card.getAttribute('data-env');
       const expanded = card.getAttribute('aria-expanded') === 'true';
       if (expanded) {
         card.setAttribute('aria-expanded', 'false');
@@ -1550,8 +1564,8 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       expandedEnvs.add(cardKey);
       const slot = card.querySelector('.exp-policy');
 
-      fetchPolicyInto(slot, env, /*useCache=*/true);
-      setTimeout(() => fetchPolicyInto(slot, env, false), 50);
+      fetchPolicyInto(slot, envPolicyId, envName, /*useCache=*/true);
+      setTimeout(() => fetchPolicyInto(slot, envPolicyId, envName, false), 50);
     }
 
     function renderPolicyBlock(s, env) {

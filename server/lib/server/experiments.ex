@@ -308,6 +308,7 @@ defmodule Server.Experiments do
     %{
       env_name: env_policy.env_name,
       env_key: env_policy.env_key,
+      env_policy_id: env_policy.id,
       config_sig: env_policy.config_sig,
       config_summary: ConfigSig.summary(env_policy.config_data || %{}),
       config_data: env_policy.config_data,

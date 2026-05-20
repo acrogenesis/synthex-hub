@@ -639,6 +639,7 @@ defmodule Server.Workers.ExperimentController do
       )
 
     attrs = %{
+      "env_policy_id" => env_policy.id,
       "env_name" => exp.env_name,
       "bit_predicates" => %{"preds" => Enum.map(preds, &PrettyPrint.to_json_term/1)},
       "policy_code" => code,

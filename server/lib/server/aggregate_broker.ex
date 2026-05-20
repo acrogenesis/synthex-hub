@@ -606,6 +606,7 @@ defmodule Server.AggregateBroker do
     payload = %{
       experiment_id: row.experiment_id,
       env_name: row.env_name,
+      env_policy_id: row.env_policy_id,
       n_episodes: n_episodes,
       active_bit: %{
         batch_id: row.batch_id,

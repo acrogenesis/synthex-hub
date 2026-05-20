@@ -1220,9 +1220,13 @@ defmodule Server.Queue do
   # ── Policy snapshots ────────────────────────────────────────
 
   @doc """
-  Upsert the latest policy snapshot for an environment. Called by
-  masters via `POST /api/master/policy-snapshots` whenever the
-  CEGAR loop accepts a new bit.
+  Upsert the latest policy snapshot for a lineage. Called by the
+  controller whenever the CEGAR commit gate accepts a new bit.
+
+  Snapshots are keyed by `env_policy_id` (the lineage) — NOT
+  `env_name`. Two parallel lineages on the same env (e.g.
+  HalfCheetah with and without tridiag features) maintain
+  independent snapshots and don't clobber each other.
   """
   def upsert_policy_snapshot(attrs, opts \\ []) do
     submitter = Keyword.get(opts, :submitter)
@@ -1233,9 +1237,9 @@ defmodule Server.Queue do
       |> stringify_top_level_keys()
 
     existing =
-      case Map.get(attrs, "env_name") do
+      case Map.get(attrs, "env_policy_id") do
         nil -> %PolicySnapshot{}
-        env -> Repo.get(PolicySnapshot, env) || %PolicySnapshot{}
+        id -> Repo.get(PolicySnapshot, id) || %PolicySnapshot{}
       end
 
     existing
@@ -1243,9 +1247,13 @@ defmodule Server.Queue do
     |> Repo.insert_or_update()
   end
 
-  @doc "Latest snapshot for an env, or `{:error, :not_found}`."
-  def get_policy_snapshot(env_name) do
-    case Repo.get(PolicySnapshot, env_name) do
+  @doc """
+  Latest snapshot for a lineage (`env_policy_id`), or
+  `{:error, :not_found}`. The dashboard polls this per-card so
+  each `(env_name, config_sig)` card gets its own policy code.
+  """
+  def get_policy_snapshot(env_policy_id) when is_binary(env_policy_id) do
+    case Repo.get(PolicySnapshot, env_policy_id) do
       nil -> {:error, :not_found}
       snapshot -> {:ok, snapshot}
     end

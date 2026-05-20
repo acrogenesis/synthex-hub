@@ -101,11 +101,53 @@ defmodule Server.Repo.Migrations.PromoteEnvPoliciesToSourceOfTruth do
 
     execute("ALTER TABLE policy_versions ALTER COLUMN env_policy_id SET NOT NULL")
 
-    # The original unique key was (experiment_id, version). The new
-    # contract is (env_policy_id, version): a lineage has at most one
-    # version-N commit, regardless of which experiment session
-    # produced it. Drop the old index, create the new one.
+    # Before rekeying the unique index, renumber `version` per
+    # env_policy lineage. The pre-migration contract was
+    # (experiment_id, version) unique, so each experiment's audit
+    # entries started at version=1. After folding multiple
+    # experiments into one lineage, multiple version=1 rows
+    # collide on the new (env_policy_id, version) key.
+    #
+    # Reassign with ROW_NUMBER() OVER (PARTITION BY env_policy_id
+    # ORDER BY inserted_at, version) so each lineage gets a
+    # contiguous 1..N sequence aligned with commit chronology.
+    # Within the same inserted_at tick, the original `version`
+    # field breaks ties (it was already monotone per-experiment).
     drop unique_index(:policy_versions, [:experiment_id, :version])
+
+    execute("""
+    WITH renum AS (
+      SELECT id,
+             ROW_NUMBER() OVER (
+               PARTITION BY env_policy_id
+               ORDER BY inserted_at, version, id
+             ) AS new_version
+      FROM policy_versions
+    )
+    UPDATE policy_versions pv
+    SET version = renum.new_version
+    FROM renum
+    WHERE pv.id = renum.id
+    """)
+
+    # Realign env_policies.policy_version to the renumbered max so
+    # future commits via Server.CommitGate (which increments
+    # env_policy.policy_version) don't collide with historical
+    # audit-log entries. If a lineage has zero audit rows (no
+    # commits ever landed for it), leave policy_version at the
+    # default 0 — its env_policy.policy_version was inherited
+    # from a winner experiment that itself had no audit entries.
+    execute("""
+    UPDATE env_policies ep
+    SET policy_version = sub.max_v
+    FROM (
+      SELECT env_policy_id, MAX(version) AS max_v
+      FROM policy_versions
+      GROUP BY env_policy_id
+    ) sub
+    WHERE ep.id = sub.env_policy_id
+    """)
+
     create unique_index(:policy_versions, [:env_policy_id, :version])
     create index(:policy_versions, [:env_policy_id, :inserted_at])
 

@@ -594,11 +594,33 @@ defmodule Server.Workers.ExperimentController do
           "current_iter" => 1
         })
 
-      __MODULE__.new(%{"experiment_id" => exp.id})
-      |> Oban.insert!()
-
+      enqueue_next_step!(exp.id)
       :ok
     end
+  end
+
+  # Self-enqueue MUST bypass `unique:` because our own job row is
+  # still in `:executing` state at the moment we insert the
+  # successor — Oban's unique check matches it and silently returns
+  # *us* instead of inserting a new job. The current `perform/1`
+  # then exits normally, the job transitions to `:completed`, and
+  # there's no successor left to run. The experiment hangs at
+  # status=running with no controller, exactly the "no checkpoint
+  # for Nm — controller Oban job may have crashed" stall pattern we
+  # hit on session 0a2db7c5.
+  #
+  # Disabling uniqueness only on this specific insert is safe:
+  #   * Bootstrap's initial controller enqueue still uses `unique:`
+  #     (no prior controller exists when it fires, so it inserts
+  #     cleanly).
+  #   * Manual/operator re-enqueues still use `unique:` and dedupe
+  #     against this controller or its scheduled successor.
+  #   * Two controllers can't actually run concurrently for the same
+  #     experiment: by the time the new job becomes `:available`,
+  #     this `perform/1` has returned and our job is `:completed`.
+  defp enqueue_next_step!(exp_id) do
+    __MODULE__.new(%{"experiment_id" => exp_id}, unique: false)
+    |> Oban.insert!()
   end
 
   # ── DB helpers ──────────────────────────────────────────────

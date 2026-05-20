@@ -402,14 +402,22 @@ defmodule Server.Experiments do
 
   defp eta_wave_seconds(%{chunks_per_min: rate} = flow, n_bits)
        when is_integer(rate) and rate > 0 do
-    total_estimate = wave_total_chunks_estimate(flow, n_bits)
-    done = flow.wave_done_chunks || 0
+    # `wave_total_chunks_estimate/2` returns nil before any bit-
+    # batches are dispatched (collect_states phase, or the brief
+    # window between wave start and the first per-bit chunk landing
+    # in the DB) — we can't compute a useful ETA yet.
+    case wave_total_chunks_estimate(flow, n_bits) do
+      nil ->
+        nil
 
-    pending = max(total_estimate - done, 0)
+      total_estimate when is_integer(total_estimate) ->
+        done = flow.wave_done_chunks || 0
+        pending = max(total_estimate - done, 0)
 
-    cond do
-      pending == 0 -> nil
-      true -> div(pending * 60, rate)
+        cond do
+          pending == 0 -> nil
+          true -> div(pending * 60, rate)
+        end
     end
   end
 

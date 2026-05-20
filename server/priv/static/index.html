@@ -456,15 +456,28 @@
       background: rgba(255, 99, 99, 0.10);
       font-weight: 600;
     }
-    .exp-state.slow {
+    .exp-state.slow,
+    .exp-state.stopped {
       color: var(--warn);
       border-color: var(--warn);
       background: rgba(255, 184, 108, 0.10);
       font-weight: 600;
     }
+    /* Clean completion — calm green, not an alarm. The previous
+       "idle" fallback styled this red, which is why a successfully
+       finished run looked like an outage. */
+    .exp-state.completed {
+      color: var(--good);
+      border-color: var(--good);
+      background: rgba(80, 200, 120, 0.10);
+      font-weight: 600;
+    }
     /* Tinted card colour-codes the failure mode at a glance:
-         stalled / idle  → red    (something is wrong)
-         slow            → yellow (working but workload >> swarm)
+         stalled / idle      → red    (something is wrong)
+         slow / stopped      → yellow (working but workload >> swarm,
+                                       or last run was killed mid-pass
+                                       but produced real accepted bits)
+         completed           → no tint (clean)
        so an operator can triage without reading the badge text. */
     .exp.stalled,
     .exp.idle {
@@ -473,7 +486,8 @@
                                   rgba(255, 99, 99, 0.06),
                                   var(--bg-elev));
     }
-    .exp.slow {
+    .exp.slow,
+    .exp.stopped {
       border-color: var(--warn);
       background: linear-gradient(180deg,
                                   rgba(255, 184, 108, 0.06),
@@ -960,15 +974,22 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       }
 
       // Active first, then envs with history but currently idle.
-      // Sort: red cards first (need attention) → yellow (slow) →
-      //       healthy live → not-currently-running envs.
+      // Sort: red cards first (need attention) → yellow (slow / last
+      //       run stopped mid-pass with real commits) → healthy live
+      //       → cleanly-completed history → never-ran-or-empty.
       //       Then alphabetical inside each tier.
       const tier = r => {
-        if (!r.active) return 3;
-        const h = r.active.health;
-        if (h === 'stalled' || h === 'idle') return 0;
-        if (h === 'slow') return 1;
-        return 2;
+        if (r.active) {
+          const h = r.active.health;
+          if (h === 'stalled' || h === 'idle') return 0;
+          if (h === 'slow') return 1;
+          return 2;
+        }
+        const lr = r.last_run;
+        if (lr && lr.status && lr.status !== 'completed' &&
+            (lr.accepted_count || 0) > 0) return 1; // yellow "stopped"
+        if (lr && lr.status === 'completed') return 3;
+        return 4;
       };
       rows.sort((a, b) => {
         const ta = tier(a), tb = tier(b);
@@ -1026,20 +1047,38 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       //                Oban job crashed; Lifeline will rescue it.
       //   "unknown"  — anything else (e.g. completed/cancelled).
       const health = isLive ? r.active.health : null;
+      // When no run is active, the badge reflects the most recent
+      // terminal run's status — "completed" (clean), "failed" /
+      // "cancelled" with accepted bits → "stopped" (incomplete but
+      // produced real commits), or "idle" if nothing meaningful has
+      // happened on this env yet.
+      const lastRun = r.last_run || null;
+      const lastHasBits = !!(lastRun && (lastRun.accepted_count || 0) > 0);
+      const restLabel =
+        lastRun && lastRun.status === 'completed' ? 'completed' :
+        lastRun && lastHasBits                    ? 'stopped'   :
+        'idle';
       const isBad  = health === 'stalled' || health === 'idle';
-      const isWarn = health === 'slow';
+      const isWarn = health === 'slow' ||
+                     (!isLive && lastRun && lastRun.status !== 'completed' && lastHasBits);
       const stateLabel =
         health === 'stalled' ? 'stalled' :
         health === 'idle'    ? 'idle'    :
         health === 'slow'    ? 'slow'    :
-        isLive               ? 'live'    : 'idle';
+        isLive               ? 'live'    : restLabel;
 
       // ── primary score line ─────────────────────────────────
       // Order of preference:
       //   1. Active experiment's running best (`active.best_reward`)
       //      — live, updates after every accepted bit.
-      //   2. All-time best across completed runs (`best_reward`).
-      //   3. "awaiting first bit" placeholder.
+      //   2. Last terminal run's best (`last_run.best_reward`) —
+      //      completed clean, or stopped after producing accepted
+      //      bits. Each accepted bit went through CommitGate's
+      //      atomic transaction, so the policy artefact at that
+      //      reward existed at some point and is just as legit as
+      //      a clean-completed run's number.
+      //   3. All-time best across runs (`best_reward`).
+      //   4. "awaiting first bit" placeholder.
       let scoreRow = '';
       if (isLive && r.active.best_reward !== null &&
                     r.active.best_reward !== undefined) {
@@ -1053,6 +1092,15 @@ mix run experiments/humanoid/round-1.exs</code></pre>
           '<div class="exp-row">' +
             '<span class="label">current best</span>' +
             '<span class="val score">' + fmtScore(r.active.best_reward) + '</span>' +
+            deltaSpan +
+          '</div>';
+      } else if (lastHasBits) {
+        const deltaSpan = fmtDeltaSpan(lastRun.delta, 'vs baseline');
+        const labelText = lastRun.status === 'completed' ? 'best' : 'best (stopped)';
+        scoreRow =
+          '<div class="exp-row">' +
+            '<span class="label">' + labelText + '</span>' +
+            '<span class="val score">' + fmtScore(lastRun.best_reward) + '</span>' +
             deltaSpan +
           '</div>';
       } else if (r.best_reward !== null && r.best_reward !== undefined) {
@@ -1093,6 +1141,28 @@ mix run experiments/humanoid/round-1.exs</code></pre>
               ? '<span class="label" style="margin-left:8px">bits</span>' +
                 '<span class="val">' + escapeHtml(String(r.latest.accepted_count)) + '</span>'
               : '') +
+          '</div>';
+      }
+
+      // ── last run line for non-clean exits ──────────────────
+      // When the most recent terminal run wasn't a clean
+      // `completed` (e.g. `failed` after Oban exhausted retries,
+      // `cancelled` by an operator), surface the achievement
+      // *and* the reason. Hiding it as "history" with null
+      // everywhere — the old behavior — buried real progress
+      // (e.g. HalfCheetah's 19 accepted bits at +2117 mean reward,
+      // killed mid-step by an OOM) and made the dashboard say
+      // "idle" for runs that had genuinely succeeded.
+      let lastRunLine = '';
+      if (!isLive && lastRun && lastRun.status !== 'completed' && lastHasBits) {
+        const reason = lastRun.error ? ' — ' + escapeHtml(lastRun.error) : '';
+        const status = escapeHtml(lastRun.status || 'stopped');
+        lastRunLine =
+          '<div class="exp-row" style="color:var(--fg-faint)">' +
+            '<span class="label">last run</span>' +
+            '<span class="val">' + status + ' at v=' +
+              escapeHtml(String(lastRun.accepted_count || 0)) + reason +
+            '</span>' +
           '</div>';
       }
 
@@ -1248,9 +1318,17 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       }
 
       const env = r.env_name;
+      // Card tint matches the badge class so cards triage at a glance:
+      // red for live alarms (stalled/idle), yellow for `slow` (live
+      // but workload >> swarm) and `stopped` (last run produced real
+      // commits but didn't finish cleanly), no tint for clean states.
+      const warnLabel = health === 'slow' ? 'slow'
+                      : (!isLive && lastRun && lastRun.status !== 'completed' && lastHasBits)
+                          ? 'stopped'
+                          : '';
       const cardCls = 'exp' +
         (isBad  ? ' ' + (health || '') : '') +
-        (isWarn ? ' slow' : '');
+        (warnLabel ? ' ' + warnLabel : '');
       // The livebit + commits divs are populated by the aggregates
       // SSE consumer and identified by experiment_id; cached
       // snapshots are re-applied immediately after re-render so they
@@ -1295,6 +1373,7 @@ mix run experiments/humanoid/round-1.exs</code></pre>
           scoreRow +
           historicalLine +
           latestLine +
+          lastRunLine +
           progressLine +
           progressBar +
           flowLine +

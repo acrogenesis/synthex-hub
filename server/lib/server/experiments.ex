@@ -262,13 +262,33 @@ defmodule Server.Experiments do
       completed = Enum.filter(exps, &(&1.status == "completed"))
       latest_completed = List.first(completed)
 
-      # Normalize each completed run's summed best_reward back to a
-      # per-episode mean using *its own* n_episodes (operators can
-      # change n_episodes between runs of the same env) before taking
-      # the max — comparing means across runs is honest, comparing
-      # sums is not.
-      best_completed =
-        completed
+      # The "last run" is the most-recent terminal experiment for
+      # this env, regardless of whether it finished cleanly. A
+      # `failed` or `cancelled` row with `accepted_count > 0` still
+      # produced real policy commits (each ran through `CommitGate`'s
+      # atomic transaction before the controller died); previously
+      # we hid those as `history` with `null` everywhere, which
+      # silently buried successful work whenever the controller's
+      # Oban supervisor ran out of retries (e.g. HalfCheetah finishing
+      # step 1/3 with 19 accepted bits, then OOM-killed mid-snooze).
+      last_run =
+        exps
+        |> Enum.reject(&(&1.status in ["pending", "running"]))
+        |> List.first()
+
+      # All-time best across runs that produced *any* accepted bit
+      # — completed and incomplete alike. A controller crash after
+      # 19 good commits is still 19 good commits; the policy
+      # artefact at that best_reward existed at some point and is
+      # comparable to a cleanly-completed run. Normalize each row by
+      # *its own* n_episodes (operators can change it between runs of
+      # the same env) before taking the max — comparing means across
+      # runs is honest, comparing sums is not.
+      best_so_far =
+        exps
+        |> Enum.filter(fn e ->
+          is_integer(e.accepted_count) and e.accepted_count > 0 and is_number(e.best_reward)
+        end)
         |> Enum.map(fn e -> normalize_reward(e.best_reward, n_episodes_for(e)) end)
         |> Enum.reject(&is_nil/1)
         |> case do
@@ -278,14 +298,16 @@ defmodule Server.Experiments do
 
       %{
         env_name: env_name,
-        status: cond do
-          active -> active.status
-          latest_completed -> "completed"
-          true -> "history"
-        end,
+        status:
+          cond do
+            active -> active.status
+            last_run -> last_run.status
+            true -> "history"
+          end,
         active: render_active(active),
         latest: render_latest(latest_completed),
-        best_reward: best_completed,
+        last_run: render_last_run(last_run),
+        best_reward: best_so_far,
         completed_count: length(completed),
         total_count: length(exps)
       }
@@ -446,6 +468,44 @@ defmodule Server.Experiments do
   end
 
   defp wave_total_chunks_estimate(_flow, _n_bits), do: nil
+
+  # Render *any* most-recent terminal run (completed, failed, or
+  # cancelled). Unlike `render_latest/1` this doesn't hide non-clean
+  # exits — it returns the run's status alongside the achievement so
+  # the dashboard can show "stopped at v=19, best=2193 (controller
+  # killed)" instead of pretending the run never happened. Returns
+  # nil only when the env has no terminal runs at all.
+  defp render_last_run(nil), do: nil
+
+  defp render_last_run(%Experiment{} = exp) do
+    n_episodes = n_episodes_for(exp)
+
+    best_mean = normalize_reward(exp.best_reward, n_episodes)
+    baseline_mean = normalize_reward(exp.baseline_reward, n_episodes)
+
+    delta =
+      cond do
+        is_number(best_mean) and is_number(baseline_mean) ->
+          best_mean - baseline_mean
+
+        true ->
+          nil
+      end
+
+    %{
+      experiment_id: exp.id,
+      status: exp.status,
+      best_reward: best_mean,
+      baseline_reward: baseline_mean,
+      best_reward_sum: exp.best_reward,
+      baseline_reward_sum: exp.baseline_reward,
+      n_episodes: n_episodes,
+      delta: delta,
+      accepted_count: exp.accepted_count || 0,
+      completed_at: exp.completed_at,
+      error: exp.error
+    }
+  end
 
   defp render_latest(nil), do: nil
 

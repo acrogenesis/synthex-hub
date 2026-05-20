@@ -92,34 +92,68 @@ defmodule Server.Experiments do
     end
   end
 
+  # The experiment row's `env_policy_id` is NOT NULL — so resolve
+  # (or create) the lineage row SYNCHRONOUSLY here, before inserting.
+  # If multiple submissions for the same `(env_name, config_sig)`
+  # land simultaneously and BOTH pass `active_for_sig?` (because the
+  # lineage doesn't exist yet), `EnvPolicies.upsert_for_submission/2`
+  # collapses them onto a single row via the unique index — and the
+  # `experiments_one_active_per_env_policy` partial unique index
+  # then kills the second experiment insert.
   defp do_insert_experiment(attrs) do
+    env_attrs = %{
+      env_name: Map.get(attrs, "env_name"),
+      env_key: Map.get(attrs, "env_key"),
+      config: Map.get(attrs, "config") || %{}
+    }
+
     Repo.transaction(fn ->
-      changeset = Experiment.changeset(%Experiment{}, attrs)
+      case Server.EnvPolicies.upsert_for_submission(env_attrs) do
+        {:ok, env_policy, _state} ->
+          attrs_with_lineage = Map.put(attrs, "env_policy_id", env_policy.id)
+          insert_experiment_with_lineage(attrs_with_lineage)
 
-      case Repo.insert(changeset) do
-        {:ok, experiment} ->
-          case Server.Workers.ExperimentBootstrap.new(%{"experiment_id" => experiment.id})
-               |> Oban.insert() do
-            {:ok, _job} ->
-              log_event!("info", "master",
-                "experiment submitted: #{experiment.env_name} (#{experiment.id})",
-                env_name: experiment.env_name,
-                experiment_id: experiment.id
-              )
-
-              experiment
-
-            {:error, reason} ->
-              Repo.rollback({:enqueue_failed, reason})
-          end
-
-        {:error, %Ecto.Changeset{errors: errors}} ->
-          Repo.rollback({:invalid, errors})
+        {:error, reason} ->
+          Repo.rollback({:env_policy_failed, reason})
       end
     end)
     |> case do
       {:ok, experiment} -> {:ok, experiment}
+      {:error, {:experiment_conflict, _}} -> {:error, :already_running}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp insert_experiment_with_lineage(attrs) do
+    changeset = Experiment.changeset(%Experiment{}, attrs)
+
+    case Repo.insert(changeset) do
+      {:ok, experiment} ->
+        case Server.Workers.ExperimentBootstrap.new(%{"experiment_id" => experiment.id})
+             |> Oban.insert() do
+          {:ok, _job} ->
+            log_event!("info", "master",
+              "experiment submitted: #{experiment.env_name} (#{experiment.id})",
+              env_name: experiment.env_name,
+              experiment_id: experiment.id
+            )
+
+            experiment
+
+          {:error, reason} ->
+            Repo.rollback({:enqueue_failed, reason})
+        end
+
+      {:error, %Ecto.Changeset{errors: errors}} ->
+        # The partial unique index `experiments_one_active_per_env_policy`
+        # fires here under the racy double-submission case described
+        # above. Surface a clean :already_running rather than a raw
+        # changeset.
+        if Keyword.has_key?(errors, :env_policy_id) do
+          Repo.rollback({:experiment_conflict, errors})
+        else
+          Repo.rollback({:invalid, errors})
+        end
     end
   end
 

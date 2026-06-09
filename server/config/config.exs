@@ -31,7 +31,11 @@ config :server, Oban,
     {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(5)},
     {Oban.Plugins.Cron, crontab: [
       {"*/5 * * * *", Server.Jobs.ReapWorkers},
-      {"*/2 * * * *", Server.Jobs.OrphanReaper}
+      {"*/2 * * * *", Server.Jobs.OrphanReaper},
+      # Keep claim_chunk's planner stats fresh against bursty
+      # available-chunk counts; without this a stale "1 available
+      # row" estimate makes claim_chunk pick an O(N²) plan and hang.
+      {"*/3 * * * *", Server.Jobs.AnalyzeObanJobs}
     ]}
   ]
 

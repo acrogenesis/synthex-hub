@@ -166,6 +166,12 @@ defmodule Server.Queue do
   defp stream_insert_chunks(%Batch{} = batch, candidates, chunk_size, payload) do
     params = Map.drop(payload, ["candidates", "chunk_size", "name"])
 
+    # Routing tag: which physics adapter a worker must have to run
+    # this chunk. Defaults to "mujoco" so every batch submitted by
+    # a master that doesn't set it (i.e. all of them today) keeps
+    # going to the CPU swarm exactly as before.
+    adapter = Map.get(payload, "adapter") || Map.get(payload, :adapter) || "mujoco"
+
     try do
       candidates
       |> Stream.chunk_every(chunk_size)
@@ -182,6 +188,7 @@ defmodule Server.Queue do
               "chunk_index" => idx,
               "cmd" => batch.cmd,
               "env_name" => batch.env_name,
+              "adapter" => adapter,
               "candidates" => chunk,
               "params" => params
             }
@@ -409,34 +416,53 @@ defmodule Server.Queue do
   jump ahead.
   """
   def claim_chunk(worker_id) do
-    # Within the same rank-within-batch, break ties RANDOMLY across
-    # batches so concurrent batches get equal-share of worker time
-    # rather than letting whichever batch was submitted first
-    # consume all worker capacity (older `scheduled_at` would
-    # always win otherwise).
+    caps = worker_capabilities(worker_id)
+
+    # Capability-aware claim, two sort layers on top of the existing
+    # fair-share:
+    #
+    #   * HARD FILTER (correctness): a chunk's adapter (defaulting to
+    #     "mujoco" for untagged chunks) must be a member of this
+    #     worker's capabilities. A CPU worker never even sees a
+    #     mujoco_warp chunk it couldn't run.
+    #
+    #   * SOFT PREFERENCE (utilization): `array_position` gives the
+    #     adapter's 1-based index in the worker's preference-ordered
+    #     capability list. Ordering by it first means a GPU worker
+    #     advertising ["mujoco_warp", "mujoco"] drains all Warp
+    #     chunks before touching any plain MuJoCo work, yet still
+    #     falls back to MuJoCo when no Warp chunks remain (rather
+    #     than sitting idle).
+    #
+    # Then the original fairness: within the same rank-within-batch,
+    # break ties RANDOMLY across batches so concurrent batches get
+    # equal share rather than letting the oldest `scheduled_at`
+    # monopolize the worker.
     sql = """
     WITH ranked AS (
       SELECT
         id,
         priority,
+        array_position($1::text[], COALESCE(args->>'adapter', 'mujoco')) AS pref,
         ROW_NUMBER() OVER (
           PARTITION BY (args->>'batch_id')
           ORDER BY scheduled_at ASC, id ASC
         ) AS rn
       FROM oban_jobs
       WHERE state = 'available' AND queue = 'chunks'
+        AND COALESCE(args->>'adapter', 'mujoco') = ANY($1::text[])
     )
     SELECT j.id
     FROM oban_jobs j
     JOIN ranked r ON r.id = j.id
     WHERE j.state = 'available' AND j.queue = 'chunks'
-    ORDER BY j.priority ASC, r.rn ASC, random()
+    ORDER BY r.pref ASC, j.priority ASC, r.rn ASC, random()
     LIMIT 1
     FOR UPDATE OF j SKIP LOCKED
     """
 
     Repo.transaction(fn ->
-      case Repo.query!(sql) do
+      case Repo.query!(sql, [caps]) do
         %Postgrex.Result{rows: [[job_id]]} ->
           job = Repo.get!(Oban.Job, job_id)
           now = DateTime.utc_now()
@@ -717,6 +743,21 @@ defmodule Server.Queue do
     |> WorkerNode.changeset(attrs)
     |> Repo.insert_or_update()
   end
+
+  # Preference-ordered adapter list for a worker, for capability
+  # routing in claim_chunk/1. An unknown worker_id (anonymous puller,
+  # or a worker that hasn't finished registering) falls back to the
+  # CPU default so it can still claim mujoco chunks — never an empty
+  # list, which would make the `= ANY(...)` filter match nothing and
+  # silently starve the worker.
+  def worker_capabilities(worker_id) when is_binary(worker_id) do
+    case Repo.get(WorkerNode, worker_id) do
+      %WorkerNode{capabilities: [_ | _] = caps} -> caps
+      _ -> ["mujoco"]
+    end
+  end
+
+  def worker_capabilities(_), do: ["mujoco"]
 
   def heartbeat(worker_id) do
     from(w in WorkerNode, where: w.id == ^worker_id)

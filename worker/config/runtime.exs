@@ -29,7 +29,35 @@ oracle_script =
   System.get_env("ORACLE_SCRIPT") ||
     Path.expand("../environments/gymnasium/oracle_port.py", Path.dirname(__ENV__.file))
 
+# WORKER_CAPABILITIES is a comma-separated, preference-ordered list
+# of physics adapters this worker can run, e.g. "mujoco_warp,mujoco"
+# for a CUDA box that prefers Warp but will fall back to plain
+# MuJoCo. Defaults to "mujoco" — the CPU swarm. The hub uses this
+# to route chunks (hard filter on membership, soft sort on order),
+# so a CPU worker must NOT advertise mujoco_warp (it can't run it),
+# and the chosen ORACLE_SCRIPT must actually implement every adapter
+# listed here.
+capabilities =
+  case System.get_env("WORKER_CAPABILITIES") do
+    nil ->
+      ["mujoco"]
+
+    "" ->
+      ["mujoco"]
+
+    csv ->
+      csv
+      |> String.split(",", trim: true)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> case do
+        [] -> ["mujoco"]
+        list -> list
+      end
+  end
+
 config :worker,
+  capabilities: capabilities,
   server_url: System.get_env("SERVER_URL", "http://localhost:4000/api"),
   api_token: System.get_env("API_TOKEN"),
   worker_id: worker_internal_id,

@@ -80,6 +80,10 @@ defmodule Server.LocalScorer do
 
     state = %{
       env_key: env_key,
+      # Physics adapter tag stamped onto every batch this scorer
+      # submits; the hub routes chunks to workers advertising a
+      # matching capability. Defaults to "mujoco" (the CPU swarm).
+      adapter: Keyword.get(opts, :adapter) || "mujoco",
       chunk_size: Keyword.get(opts, :chunk_size, @default_chunk_size),
       collect_chunk_size:
         Keyword.get(opts, :collect_states_chunk_size, @default_collect_chunk_size),
@@ -129,6 +133,7 @@ defmodule Server.LocalScorer do
       |> Map.put("name", batch_name)
       |> Map.put("chunk_size", state.chunk_size)
       |> Map.put("candidates", augmented)
+      |> Map.put("adapter", state.adapter)
       |> maybe_put_experiment_id(state.experiment_id)
 
     case Queue.submit_batch(payload, submitter: state.submitter) do
@@ -167,6 +172,7 @@ defmodule Server.LocalScorer do
         |> Map.put("candidates", seeds)
         |> Map.delete("seeds")
         |> Map.put_new("state_stride", state.state_stride)
+        |> Map.put("adapter", state.adapter)
         |> maybe_put_experiment_id(state.experiment_id)
 
       case Queue.submit_batch(payload, submitter: state.submitter) do

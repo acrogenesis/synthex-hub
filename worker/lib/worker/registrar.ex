@@ -56,6 +56,7 @@ defmodule Worker.Registrar do
       hostname: Application.get_env(:worker, :hostname),
       pool_size: Application.get_env(:worker, :pool_size, 1),
       version: Application.spec(:worker, :vsn) |> to_string(),
+      capabilities: capabilities(),
       metadata: %{
         elixir: System.version(),
         otp: System.otp_release()
@@ -78,4 +79,18 @@ defmodule Worker.Registrar do
 
   defp worker_id, do: Application.get_env(:worker, :worker_id)
   defp display_name, do: Application.get_env(:worker, :display_name, "anonymous")
+
+  # Ordered list of physics adapters this worker can run, most
+  # preferred first. The hub hard-filters chunks to adapters in
+  # this list and soft-orders by position, so a GPU box configured
+  # with `["mujoco_warp", "mujoco"]` drains Warp work first but
+  # falls back to plain MuJoCo when idle. Defaults to `["mujoco"]`
+  # — the CPU swarm — so a worker that doesn't set WORKER_CAPABILITIES
+  # behaves exactly as before capability routing existed.
+  defp capabilities do
+    case Application.get_env(:worker, :capabilities) do
+      list when is_list(list) and list != [] -> Enum.map(list, &to_string/1)
+      _ -> ["mujoco"]
+    end
+  end
 end

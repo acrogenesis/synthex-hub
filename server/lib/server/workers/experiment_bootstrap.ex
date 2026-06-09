@@ -252,9 +252,11 @@ defmodule Server.Workers.ExperimentBootstrap do
     collect_chunk_size = get_int(config, "collect_states_chunk_size", 4)
     state_stride = get_int(config, "state_stride", 10)
     poll_interval_ms = get_int(config, "poll_interval_ms", 500)
+    adapter = get_adapter(config)
 
     Server.LocalScorer.new(
       env_key: env_key,
+      adapter: adapter,
       chunk_size: chunk_size,
       collect_states_chunk_size: collect_chunk_size,
       state_stride: state_stride,
@@ -262,6 +264,19 @@ defmodule Server.Workers.ExperimentBootstrap do
       batch_name_prefix: "exp-#{experiment_id_short(experiment_id)}",
       experiment_id: experiment_id
     )
+  end
+
+  # Physics adapter for this experiment's chunks. Defaults to
+  # "mujoco" so existing experiments route to the CPU swarm; a
+  # Warp experiment sets `"adapter": "mujoco_warp"` in its config.
+  # Not part of config_sig — the Warp env is a distinct env_name
+  # (a "different legit environment"), so its lineage is already
+  # separated by name; the adapter tag is purely for routing.
+  defp get_adapter(config) do
+    case Map.get(config, "adapter") || Map.get(config, :adapter) do
+      a when is_binary(a) and a != "" -> a
+      _ -> "mujoco"
+    end
   end
 
   defp experiment_id_short(id) when is_binary(id), do: String.slice(id, 0, 8)

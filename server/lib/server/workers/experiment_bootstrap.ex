@@ -248,11 +248,12 @@ defmodule Server.Workers.ExperimentBootstrap do
   # difference between fitting in our 4 GB Fly machines and OOMing
   # on Ant's tridiag pool (≈ 300 K candidates per `score_bit`).
   defp build_local_scorer(env_key, experiment_id, config) do
-    chunk_size = get_int(config, "chunk_size", 10)
-    collect_chunk_size = get_int(config, "collect_states_chunk_size", 4)
+    adapter = get_adapter(config)
+    {default_chunk, default_collect} = default_chunk_sizes(adapter)
+    chunk_size = get_int(config, "chunk_size", default_chunk)
+    collect_chunk_size = get_int(config, "collect_states_chunk_size", default_collect)
     state_stride = get_int(config, "state_stride", 10)
     poll_interval_ms = get_int(config, "poll_interval_ms", 500)
-    adapter = get_adapter(config)
 
     Server.LocalScorer.new(
       env_key: env_key,
@@ -278,6 +279,20 @@ defmodule Server.Workers.ExperimentBootstrap do
       _ -> "mujoco"
     end
   end
+
+  # Adapter-aware {score_bit, collect_states} chunk-size defaults.
+  # The two adapters want OPPOSITE granularity, and the wrong default
+  # silently kills throughput:
+  #   * mujoco (CPU swarm): one Python rollout loop per candidate, so
+  #     SMALL chunks keep per-chunk wall-time sane and load-balance
+  #     across many workers.
+  #   * mujoco_warp (GPU): a whole chunk is ONE batched launch of
+  #     `chunk_size * n_episodes` worlds, so it must be LARGE or the
+  #     GPU starves (a size-10 chunk = 300 worlds ≈ CPU-tied, 0% util).
+  # Explicit `chunk_size` / `collect_states_chunk_size` in the config
+  # always override these.
+  defp default_chunk_sizes("mujoco_warp"), do: {128, 128}
+  defp default_chunk_sizes(_), do: {10, 4}
 
   defp experiment_id_short(id) when is_binary(id), do: String.slice(id, 0, 8)
   defp experiment_id_short(_), do: "unknown"

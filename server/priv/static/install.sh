@@ -463,6 +463,26 @@ if ! docker ps --filter "id=$CONTAINER_ID" --format '{{.ID}}' | grep -q .; then
   die "worker failed to start."
 fi
 
+# GPU self-test: prove this worker will actually run MuJoCo-Warp on the
+# GPU for real chunks instead of silently falling back to CPU. Runs the
+# exact make_backend() decision at a representative batch size inside
+# the container, so a large-nworld failure (CUDA-graph capture, OOM,
+# missing CUDA in the container) is caught HERE with its reason — no
+# need to dig through logs. First run compiles CUDA kernels (and warms
+# the shared cache the oracle reuses), so allow ~1-2 min.
+if [ "$WARP" = 1 ]; then
+  hr
+  printf >&2 '%s\n' "Running GPU self-test (compiling CUDA kernels — first run ~1-2 min)..."
+  if docker exec "$CONTAINER_NAME" \
+       python3 /app/environments/gymnasium/warp_selftest.py >&2 2>&1; then
+    ok "GPU self-test ${C_BOLD}PASSED${C_RESET}${C_GREEN} — this worker runs MuJoCo-Warp on the GPU.${C_RESET}"
+  else
+    warn "GPU self-test ${C_BOLD}FAILED${C_RESET} — this worker would run on CPU (~50x slower)."
+    warn "The cause is the [warp-backend] / traceback line printed just above."
+    warn "Fix that, then re-run this installer to re-test."
+  fi
+fi
+
 ok "Worker ${C_BOLD}${WORKER_NAME}${C_RESET}${C_GREEN} is connected.${C_RESET}"
 hr
 cat <<EOF >&2

@@ -93,8 +93,7 @@ defmodule Server.Workers.ExperimentController do
   require Logger
   import Ecto.Query
 
-  alias Server.{CommitGate, EnvPolicies, EnvPolicy, Experiment, Experiments,
-                Queue, Repo}
+  alias Server.{CommitGate, EnvPolicies, EnvPolicy, Experiment, Experiments, Queue, Repo}
   alias Server.Workers.{ExperimentBootstrap, ExperimentComplete}
   alias Synthex.Core.PrettyPrint
   alias Synthex.Gym.Mujoco
@@ -186,7 +185,7 @@ defmodule Server.Workers.ExperimentController do
 
   defp run_step(%Experiment{} = exp, _args) do
     env_key = ExperimentBootstrap.decode_env_key(exp.env_key)
-    ctx = ExperimentBootstrap.build_context(env_key, exp.config, exp.id)
+    ctx = ExperimentBootstrap.build_context(env_key, exp.config, exp.id, exp.env_name)
     cegar_iter = exp.current_cegar_iter
     epsilon = acceptance_epsilon(exp.config)
     bit_concurrency = bit_concurrency(exp.config)
@@ -279,7 +278,17 @@ defmodule Server.Workers.ExperimentController do
 
   # ── One pass over the open bits ─────────────────────────────
 
-  defp dispatch_wave(exp_id, ctx, features, seeds, cegar_iter, epsilon, concurrency, wave_num, acc) do
+  defp dispatch_wave(
+         exp_id,
+         ctx,
+         features,
+         seeds,
+         cegar_iter,
+         epsilon,
+         concurrency,
+         wave_num,
+         acc
+       ) do
     {:ok, exp_before} = Experiments.get(exp_id)
 
     cond do
@@ -397,9 +406,7 @@ defmodule Server.Workers.ExperimentController do
         {{nc, ns, ni, nf + 1}, a}
 
       {:ok, %Experiment{status: status}} when status != "running" ->
-        Logger.info(
-          "[Controller] bit #{bit_idx}: experiment status=#{status}, halting pass"
-        )
+        Logger.info("[Controller] bit #{bit_idx}: experiment status=#{status}, halting pass")
 
         {{nc, ns, ni, nf + 1}, a}
 
@@ -410,8 +417,7 @@ defmodule Server.Workers.ExperimentController do
 
         case evaluate_bit(preds_now, bit_idx, features, ctx, seeds) do
           :no_improvement ->
-            {{nc, ns, ni + 1, nf},
-             %{a | settled_at: Map.put(a.settled_at, bit_idx, v_current)}}
+            {{nc, ns, ni + 1, nf}, %{a | settled_at: Map.put(a.settled_at, bit_idx, v_current)}}
 
           {:improved, candidate, reward} ->
             apply_commit(
@@ -566,9 +572,7 @@ defmodule Server.Workers.ExperimentController do
         {{nc, ns, ni, nf + 1}, a}
 
       {:error, reason} ->
-        Logger.warning(
-          "[Controller] commit gate error for bit #{bit_idx}: #{inspect(reason)}"
-        )
+        Logger.warning("[Controller] commit gate error for bit #{bit_idx}: #{inspect(reason)}")
 
         {{nc, ns, ni, nf}, a}
     end

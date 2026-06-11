@@ -80,6 +80,7 @@ defmodule Server.LocalScorer do
 
     state = %{
       env_key: env_key,
+      env_name: Keyword.get(opts, :env_name),
       # Physics adapter tag stamped onto every batch this scorer
       # submits; the hub routes chunks to workers advertising a
       # matching capability. Defaults to "mujoco" (the CPU swarm).
@@ -131,6 +132,7 @@ defmodule Server.LocalScorer do
     payload =
       request
       |> Map.put("name", batch_name)
+      |> put_env_name(state.env_name)
       |> Map.put("chunk_size", state.chunk_size)
       |> Map.put("candidates", augmented)
       |> Map.put("adapter", state.adapter)
@@ -168,6 +170,7 @@ defmodule Server.LocalScorer do
         request
         |> Map.put("name", batch_name)
         |> Map.put("cmd", "collect_states")
+        |> put_env_name(state.env_name)
         |> Map.put("chunk_size", state.collect_chunk_size)
         |> Map.put("candidates", seeds)
         |> Map.delete("seeds")
@@ -207,6 +210,12 @@ defmodule Server.LocalScorer do
   defp dispatch(request, %{fallback: fallback}), do: fallback.(request)
 
   # ── Helpers ────────────────────────────────────────────────
+
+  defp put_env_name(payload, env_name) when is_binary(env_name) and env_name != "" do
+    Map.put(payload, "env_name", env_name)
+  end
+
+  defp put_env_name(payload, _), do: payload
 
   defp unpack_score_bit_items([], batch_id) do
     {:error, "score_bit batch #{batch_id} completed with zero items"}

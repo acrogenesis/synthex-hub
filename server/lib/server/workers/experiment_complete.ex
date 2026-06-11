@@ -44,7 +44,7 @@ defmodule Server.Workers.ExperimentComplete do
 
   defp finalize(%Experiment{} = exp) do
     env_key = ExperimentBootstrap.decode_env_key(exp.env_key)
-    ctx = ExperimentBootstrap.build_context(env_key, exp.config, exp.id)
+    ctx = ExperimentBootstrap.build_context(env_key, exp.config, exp.id, exp.env_name)
 
     {:ok, env_policy} = EnvPolicies.for_experiment(exp)
     preds = decode_predicates(env_policy.predicates)

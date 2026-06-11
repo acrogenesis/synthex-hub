@@ -274,6 +274,11 @@
       text-transform: uppercase; letter-spacing: 0.05em;
       margin-bottom: 8px;
     }
+    .exp-policy .policy-head-right {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    }
+    /* Let users select the policy code without the card toggling. */
+    .exp-policy pre, .exp-policy pre code { user-select: text; cursor: text; }
     .exp-policy pre {
       margin: 0;
       padding: 14px 16px;
@@ -1544,6 +1549,12 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       // Don't toggle when the click landed on a link inside the card.
       if (event && event.target && event.target.closest('a')) return;
 
+      // Don't toggle when interacting with the expanded policy panel —
+      // otherwise selecting/copying the policy code collapses the card
+      // out from under the click. Collapse is still available via the
+      // card head/chevron (outside .exp-policy).
+      if (event && event.target && event.target.closest('.exp-policy')) return;
+
       // Expansion is tracked per-card-key (env_name + config_sig) so
       // two lineages for the same env (different policy-shape configs)
       // remember their expansion state independently. The policy
@@ -1603,10 +1614,30 @@ mix run experiments/humanoid/round-1.exs</code></pre>
       return (
         '<div class="policy-head">' +
           '<span>current policy (' + escapeHtml(lang) + ')</span>' +
-          '<span>' + headBits.map(escapeHtml).join(' · ') + '</span>' +
+          '<span class="policy-head-right">' +
+            '<span>' + headBits.map(escapeHtml).join(' · ') + '</span>' +
+            '<button class="copy" type="button" ' +
+                    'onclick="copyPolicy(this, event)">copy</button>' +
+          '</span>' +
         '</div>' +
         '<pre><code>' + escapeHtml(s.policy_code) + '</code></pre>'
       );
+    }
+
+    function copyPolicy(btn, event) {
+      // Keep the click from bubbling to the card's toggleExp handler.
+      if (event) event.stopPropagation();
+      const panel = btn.closest('.exp-policy');
+      const code = panel && panel.querySelector('pre code');
+      if (!code) return;
+      navigator.clipboard.writeText(code.textContent).then(() => {
+        btn.textContent = 'copied';
+        btn.classList.add('ok');
+        setTimeout(() => {
+          btn.textContent = 'copy';
+          btn.classList.remove('ok');
+        }, 1500);
+      });
     }
 
     function fmtUpdatedAt(iso) {
